@@ -8,7 +8,7 @@ tiles in the disk and serve them wtihout the need to reach OSM servers.
 This code uses Gorilla Mux to generate HTTP routes, all dependencies are included in the go.mod 
 file.
 
-You can use Make to compile. Just use those commands to compile to your target OS:
+You can use Make to compile. Just use one of the following commands to compile to your target OS:
 
 - ```make build-linux```
 - ```make build-windows```
