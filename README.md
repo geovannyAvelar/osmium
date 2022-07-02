@@ -21,6 +21,6 @@ This is a very simple project and it might be improved.
 - Write unit tests and improve the code testability;
 - Create an option to store tiles in AWS S3 (or other cloud storages);
 - Dockerize the project;
-- Create an option to download a set of tiles based on a bounding box;
-- Allow users to choose other map providers, no just OSM;
+- Create an option to download a set of tiles based in a bounding box;
+- Allow users to choose other map providers, not just OSM;
 - An endpoint to find a tile by its WGS84 coordinate.
