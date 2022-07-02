@@ -18,6 +18,7 @@ You can use Make to compile. Just use those commands to compile to your target O
 
 This is a very simple project and it might be improved.
 
+- Write unit tests and improve the code testability;
 - Create an option to store tiles in AWS S3 (or other cloud storages);
 - Dockerize the project;
 - Create an option to download a set of tiles based on a bounding box;
