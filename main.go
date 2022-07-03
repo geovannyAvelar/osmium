@@ -58,7 +58,7 @@ func tileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := loadTile(vector)
+	b, err := loadTile(vector, "tiles")
 
 	if err != nil {
 		http.Error(w, "Cannot load tile.", http.StatusInternalServerError)
@@ -69,26 +69,26 @@ func tileHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func loadTile(v *Vector) ([]byte, error) {
+func loadTile(v *Vector, dir string) ([]byte, error) {
 	filename := fmt.Sprintf("tiles/%d-%d-%d.png", v.x, v.y, v.z)
 
 	if checkIfFileExists(filename) {
 		return os.ReadFile(filename)
 	}
 
-	b, err := loadTileFromOsm(v)
+	b, err := loadTileFromMapProvider(v, "https://tile.openstreetmap.org/%d/%d/%d.png")
 
 	if err != nil {
 		return nil, err
 	}
 
-	writeTileInDisk(filename, b)
+	writeTileInDisk(dir, filename, b)
 
 	return b, err
 }
 
-func loadTileFromOsm(v *Vector) ([]byte, error) {
-	tileUri := fmt.Sprintf("https://tile.openstreetmap.org/%d/%d/%d.png", v.z, v.x, v.y)
+func loadTileFromMapProvider(v *Vector, mapUri string) ([]byte, error) {
+	tileUri := fmt.Sprintf(mapUri, v.z, v.x, v.y)
 
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", tileUri, nil)
@@ -115,22 +115,24 @@ func loadTileFromOsm(v *Vector) ([]byte, error) {
 	return b, nil
 }
 
-func writeTileInDisk(filename string, b []byte) {
-	go func(fileBytes []byte) {
-		if !checkIfFileExists("tiles") {
-			err := os.Mkdir("tiles", 0644)
-
-			if err != nil {
-				log.Printf("Cannot create tiles directory, Cause: %s", err.Error())
-			}
-		}
-
-		err := os.WriteFile(filename, fileBytes, 0644)
+func writeTileInDisk(dir, filename string, b []byte) error {
+	if !checkIfFileExists(dir) {
+		err := os.Mkdir(dir, 0700)
 
 		if err != nil {
-			log.Printf("Cannot save tile %s in the disk, Cause: %s", filename, err.Error())
+			log.Printf("Cannot create tiles directory, Cause: %s", err.Error())
+			return err
 		}
-	}(b)
+	}
+
+	err := os.WriteFile(dir+"/"+filename, b, 0700)
+
+	if err != nil {
+		log.Printf("Cannot save tile %s in the disk, Cause: %s", filename, err.Error())
+		return err
+	}
+
+	return nil
 }
 
 func checkIfFileExists(name string) bool {
