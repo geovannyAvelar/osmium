@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 )
 
 const OSM_TILES_URI = "https://tile.openstreetmap.org/%d/%d/%d.png"
+const TILES_DIR_PATH = "tiles"
 
 var errDownloadTilesLimit = errors.New("Cannot download more than 250 tiles in zoom levels higher than 13")
 
@@ -42,6 +45,7 @@ func main() {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/{z}/{x}/{y}.png", tileHandler).Methods("GET")
+	r.HandleFunc("/update-tiles", downloadTilesInBoundingBoxHandler).Methods("POST")
 	http.Handle("/", r)
 
 	log.Fatal(http.ListenAndServe(":8000", r))
@@ -57,7 +61,7 @@ func tileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := loadTile(*vector, "tiles")
+	_, b, err := loadTile(*vector, TILES_DIR_PATH)
 
 	if err != nil {
 		http.Error(w, "Cannot load tile.", http.StatusInternalServerError)
@@ -74,20 +78,15 @@ func tileHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func downloadTilesInBoundingBoxHandler(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
+	params := r.URL.Query()
 	top, bottom, err := parseBoundingBoxParams(params)
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	zoomLevel, err := strconv.Atoi(params["zoom_level"])
-
-	if err != nil {
-		http.Error(w, "Zoom level is invalid", http.StatusBadRequest)
-	}
-
-	numberOfTiles, err := downloadTilesInBoundingBox(*top, *bottom, zoomLevel, OSM_TILES_URI)
+	tiles, err := downloadTilesInBoundingBox(*top, *bottom, OSM_TILES_URI, TILES_DIR_PATH)
 
 	if err != nil {
 		if err == errDownloadTilesLimit {
@@ -96,50 +95,63 @@ func downloadTilesInBoundingBoxHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	msg := fmt.Sprintf("%d tile(s) processed", numberOfTiles)
-	w.Write([]byte(msg))
+	json.NewEncoder(w).Encode(tiles)
 }
 
-func downloadTilesInBoundingBox(top gosm.Tile, bottom gosm.Tile, zoomLevel int, mapUri string) (int, error) {
-	tiles, err := listTilesInABoundingBox(top, bottom, zoomLevel)
-
-	if err != nil {
-		return 0, err
-	}
-
-	if len(tiles) >= 250 && zoomLevel > 13 {
-		return 0, errDownloadTilesLimit
-	}
-
-	numberOfTiles := 0
-
-	for _, t := range tiles {
-		_, err := loadTile(*t, "tiles")
-		if err == nil {
-			numberOfTiles++
-		}
-	}
-
-	return numberOfTiles, nil
-}
-
-func loadTile(v gosm.Tile, dir string) ([]byte, error) {
-	// TODO Fix this path to work on other OSes
-	filename := dir + "/" + createTileFilename(v.X, v.Y, v.Z)
-
-	if checkIfFileExists(filename) {
-		return os.ReadFile(filename)
-	}
-
-	b, err := loadTileFromMapProvider(v, OSM_TILES_URI)
+func downloadTilesInBoundingBox(top gosm.Tile, bottom gosm.Tile, mapUri, tilesDir string) ([]string, error) {
+	tiles, err := listTilesInABoundingBox(top, bottom)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return b, err
+	if len(tiles) >= 250 {
+		return nil, errDownloadTilesLimit
+	}
+
+	tilesProcessed := []string{}
+
+	for _, t := range tiles {
+		filepath, b, err := loadTile(*t, tilesDir)
+		if err == nil {
+			if checkIfFileExists(filepath) {
+				continue
+			}
+
+			err := createDirIfNotExists(tilesDir)
+
+			if err == nil {
+				err := writeTileInDisk(filepath, b)
+
+				if err == nil {
+					tilesProcessed = append(tilesProcessed, filepath)
+				}
+			}
+		}
+	}
+
+	return tilesProcessed, nil
+}
+
+func loadTile(v gosm.Tile, dir string) (string, []byte, error) {
+	// TODO Fix this path to work on other OSes
+	filepath := dir + "/" + createTileFilename(v.X, v.Y, v.Z)
+
+	if checkIfFileExists(filepath) {
+		b, err := os.ReadFile(filepath)
+		return filepath, b, err
+	}
+
+	b, err := loadTileFromMapProvider(v, OSM_TILES_URI)
+
+	if err != nil {
+		return "", nil, err
+	}
+
+	return filepath, b, err
 }
 
 func loadTileFromMapProvider(v gosm.Tile, mapUri string) ([]byte, error) {
@@ -170,9 +182,9 @@ func loadTileFromMapProvider(v gosm.Tile, mapUri string) ([]byte, error) {
 	return b, nil
 }
 
-func listTilesInABoundingBox(top gosm.Tile, bottom gosm.Tile, zoomLevel int) ([]*gosm.Tile, error) {
-	t1 := gosm.NewTileWithLatLong(top.Lat, top.Long, zoomLevel)
-	t2 := gosm.NewTileWithLatLong(top.Lat, top.Long, zoomLevel)
+func listTilesInABoundingBox(top gosm.Tile, bottom gosm.Tile) ([]*gosm.Tile, error) {
+	t1 := gosm.NewTileWithLatLong(top.Lat, top.Long, 19)
+	t2 := gosm.NewTileWithLatLong(top.Lat, top.Long, 19)
 
 	return gosm.BBoxTiles(*t1, *t2)
 }
@@ -215,13 +227,11 @@ func checkIfFileExists(name string) bool {
 	return false
 }
 
-func parseBoundingBoxParams(params map[string]string) (*gosm.Tile, *gosm.Tile, error) {
-	tLat, tLon, bLat, bLon := params["topLat"], params["topLon"], params["bottomLat"], params["bottomLon"]
-
-	topLat, errTLat := strconv.ParseFloat(tLat, 32)
-	topLon, errTLon := strconv.ParseFloat(tLon, 32)
-	bottomLat, errBLat := strconv.ParseFloat(bLat, 32)
-	bottomLon, errBLon := strconv.ParseFloat(bLon, 32)
+func parseBoundingBoxParams(params url.Values) (*gosm.Tile, *gosm.Tile, error) {
+	topLat, errTLat := strconv.ParseFloat(params.Get("topLat"), 32)
+	topLon, errTLon := strconv.ParseFloat(params.Get("topLon"), 32)
+	bottomLat, errBLat := strconv.ParseFloat(params.Get("bottomLat"), 32)
+	bottomLon, errBLon := strconv.ParseFloat(params.Get("bottomLon"), 32)
 
 	if errTLat != nil || errTLon != nil || errBLat != nil || errBLon != nil {
 		return nil, nil, errors.New("Invalid bounding box values")
