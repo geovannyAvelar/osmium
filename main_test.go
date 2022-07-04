@@ -8,15 +8,17 @@ import (
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/apeyroux/gosm"
 )
 
 func TestNewVectorFromMapParams(t *testing.T) {
 	tt := []struct {
 		vectorParams map[string]string
-		vector       *Vector
+		vector       *gosm.Tile
 		mustBeValid  bool
 	}{
-		{map[string]string{"x": "1", "y": "1", "z": "1"}, &Vector{x: 1, y: 1, z: 1}, true},
+		{map[string]string{"x": "1", "y": "1", "z": "1"}, &gosm.Tile{X: 1, Y: 1, Z: 1}, true},
 		{map[string]string{"y": "1", "z": "1"}, nil, false},
 		{map[string]string{"x": "", "z": "1"}, nil, false},
 		{map[string]string{"x": "1", "y": "1"}, nil, false},
@@ -41,7 +43,7 @@ func TestLoadTileFromMapProvider(t *testing.T) {
 		w.Write(payload)
 	}))
 
-	b, err := loadTileFromMapProvider(&Vector{1, 1, 1}, osmServer.URL+"/%d/%d/%d")
+	b, err := loadTileFromMapProvider(gosm.Tile{X: 1, Y: 1, Z: 1}, osmServer.URL+"/%d/%d/%d")
 
 	if err != nil {
 		t.Errorf("Error during tile loading from provider. Cause: %s", err.Error())
@@ -54,18 +56,20 @@ func TestLoadTileFromMapProvider(t *testing.T) {
 
 func TestWriteTileInDisk(t *testing.T) {
 	dir := "test-tiles"
-	filename := "test" + strconv.Itoa(rand.Intn(1000))
+	filename := dir + "/" + "test" + strconv.Itoa(rand.Intn(1000))
+
+	createDirIfNotExists(dir)
 
 	defer os.RemoveAll(dir)
 
-	err := writeTileInDisk(dir, filename, []byte{})
+	err := writeTileInDisk(filename, []byte{})
 
 	if err != nil {
-		t.Errorf("Error during tile writing")
+		t.Errorf("Error during tile writing. Cause %s", err.Error())
 		return
 	}
 
-	fileExists := checkIfFileExists(dir + "/" + filename)
+	fileExists := checkIfFileExists(filename)
 
 	if !fileExists {
 		t.Errorf("File not found")
