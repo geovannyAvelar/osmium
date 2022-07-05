@@ -1,3 +1,5 @@
+#!/bin/bash
+
 docker build -t osm-cache .
 docker stop osm-cache
 docker container rm osm-cache
