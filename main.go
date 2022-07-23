@@ -5,15 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/apeyroux/gosm"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const OSM_TILES_URI = "https://tile.openstreetmap.org/%d/%d/%d.png"
@@ -48,7 +51,17 @@ func main() {
 	r.HandleFunc("/update-tiles", downloadTilesInBoundingBoxHandler).Methods("POST")
 	http.Handle("/", r)
 
-	log.Fatal(http.ListenAndServe(":8000", r))
+	headersOk := handlers.AllowedHeaders([]string{"X-Requested-With"})
+	originsOk := handlers.AllowedOrigins(getAllowedOrigins())
+	methodsOk := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "OPTIONS"})
+
+	handler := handlers.CORS(originsOk, headersOk, methodsOk)(r)
+
+	host := fmt.Sprintf(":%d", getApiPort())
+
+	log.Info("Listening at " + host)
+
+	log.Fatal(http.ListenAndServe(host, handler))
 }
 
 func tileHandler(w http.ResponseWriter, r *http.Request) {
@@ -250,4 +263,45 @@ func createTileFilename(x, y, z int) string {
 
 func getUserAgent() string {
 	return fmt.Sprintf("osm-cache/v0.0.1 (%s)", runtime.GOOS)
+}
+
+func getAllowedOrigins() []string {
+	envVar := os.Getenv("OSM_CACHE_ALLOWED_ORIGINS")
+
+	if envVar != "" {
+		return strings.Split(envVar, ",")
+	}
+
+	log.Warn("OSM_CACHE_ALLOWED_ORIGINS enviroment variable is not defined. Accepting only local connections")
+
+	return []string{getLocalHost()}
+}
+
+func getApiPort() int {
+	envVar := os.Getenv("PORT")
+
+	if envVar != "" {
+		port, err := strconv.Atoi(envVar)
+
+		if err == nil {
+			return port
+		}
+
+		log.Warn("Cannot parse PORT enviroment variable. Port must be an integer.")
+	}
+
+	log.Warn("PORT is not defined.")
+	log.Warn("Using default port 8000.")
+
+	return 8000
+}
+
+func getLocalHost() string {
+	logLevel := log.GetLevel()
+
+	log.SetLevel(0)
+	port := getApiPort()
+	log.SetLevel(logLevel)
+
+	return fmt.Sprintf("http://localhost:%d", port)
 }
