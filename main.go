@@ -46,10 +46,11 @@ func newVectorFromMapParams(params map[string]string) (*gosm.Tile, error) {
 
 func main() {
 	r := mux.NewRouter()
+	basePath := getRootPath()
+	r = r.PathPrefix(basePath).Subrouter()
 
 	r.HandleFunc("/{z}/{x}/{y}.png", tileHandler).Methods("GET")
 	r.HandleFunc("/update-tiles", downloadTilesInBoundingBoxHandler).Methods("POST")
-	http.Handle("/", r)
 
 	headersOk := handlers.AllowedHeaders([]string{"X-Requested-With"})
 	originsOk := handlers.AllowedOrigins(getAllowedOrigins())
@@ -59,7 +60,7 @@ func main() {
 
 	host := fmt.Sprintf(":%d", getApiPort())
 
-	log.Info("Listening at " + host)
+	log.Info("Listening at " + host + basePath)
 
 	log.Fatal(http.ListenAndServe(host, handler))
 }
@@ -304,4 +305,18 @@ func getLocalHost() string {
 	log.SetLevel(logLevel)
 
 	return fmt.Sprintf("http://localhost:%d", port)
+}
+
+func getRootPath() string {
+	root := os.Getenv("BASE_PATH")
+
+	if root != "" && len(root) > 0 {
+		if root[0] == '/' {
+			return root
+		}
+	}
+
+	log.Warn("BASE_PATH enviroment variable is not defined. Default is /")
+
+	return "/"
 }
