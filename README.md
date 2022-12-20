@@ -1,7 +1,7 @@
 # OpenStreetMap Tiles Cache Server
 
-This repository contains a small proxy server written in Go 1.18 capable to cache OpenStreetMap 
-tiles in the disk and serve them wtihout the need to reach OSM servers.
+This repository contains a small proxy server written in Go capable to cache OpenStreetMap 
+tiles in the disk and serve them without the need to reach OSM servers.
 
 ## Build instructions
 ### With Make
