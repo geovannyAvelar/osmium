@@ -198,7 +198,7 @@ func loadTileFromMapProvider(v gosm.Tile, mapUri string) ([]byte, error) {
 
 func listTilesInABoundingBox(top gosm.Tile, bottom gosm.Tile) ([]*gosm.Tile, error) {
 	t1 := gosm.NewTileWithLatLong(top.Lat, top.Long, 19)
-	t2 := gosm.NewTileWithLatLong(top.Lat, top.Long, 19)
+	t2 := gosm.NewTileWithLatLong(bottom.Lat, bottom.Long, 19)
 
 	return gosm.BBoxTiles(*t1, *t2)
 }
