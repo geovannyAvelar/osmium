@@ -42,7 +42,7 @@ func TestGetTile(t *testing.T) {
 		return
 	}
 
-	if bytes.Compare(tile.Bytes, payload) != 0 {
+	if !bytes.Equal(tile.Bytes, payload) {
 		t.Errorf("Returned bytes are not equal. Received %b but expected %b", tile.Bytes, payload)
 	}
 
@@ -62,7 +62,7 @@ func TestDownloadTile(t *testing.T) {
 		t.Errorf("Cannot download tile. Cause: %s", err)
 	}
 
-	if bytes.Compare(b, payload) != 0 {
+	if !bytes.Equal(b, payload) {
 		t.Errorf("Returned bytes are not equal. Received %b but expected %b", b, payload)
 	}
 
@@ -109,7 +109,7 @@ func TestGetTileFromDisk(t *testing.T) {
 		t.Errorf("Cannot read tile from disk. Cause: %s", err)
 	}
 
-	if bytes.Compare(tile.Bytes, payload) != 0 {
+	if !bytes.Equal(tile.Bytes, payload) {
 		t.Errorf("Returned bytes are not equal. Received %b but expected %b", tile.Bytes, payload)
 	}
 
