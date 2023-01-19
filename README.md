@@ -23,6 +23,4 @@ This is a very simple project and it might be improved.
 
 - Write unit tests and improve the code testability;
 - Create an option to store tiles in AWS S3 (or other cloud storages);
-- Allow users to choose other map providers, not just OSM;
 - An endpoint to find a tile by its WGS84 coordinate;
-- Capability to handle JPG tiles.

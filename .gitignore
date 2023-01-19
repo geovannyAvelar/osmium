@@ -27,4 +27,4 @@ go.work
 build/
 
 # Tiles dir
-tiles/*.png
+*.png
