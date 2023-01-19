@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
@@ -92,7 +93,8 @@ func (a *HttpApi) handleTile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tile, err = provider.GetTile(tile.X, tile.Y, tile.Z, format)
+	params := convertQueryValuesToConfigParams(r.URL.Query())
+	tile, err = provider.GetTile(tile.X, tile.Y, tile.Z, format, params...)
 
 	if err != nil {
 		http.Error(w, errors.Unwrap(err).Error(), http.StatusInternalServerError)
@@ -156,4 +158,16 @@ func (a *HttpApi) getTileFormat(name string) (TileFormat, error) {
 	}
 
 	return "", errors.New("Invalid format " + name)
+}
+
+func convertQueryValuesToConfigParams(values url.Values) []*ConfigParam {
+	confParams := make([]*ConfigParam, len(values))
+
+	i := 0
+	for k, v := range values {
+		confParams[i] = &ConfigParam{Name: k, Values: v}
+		i++
+	}
+
+	return confParams
 }

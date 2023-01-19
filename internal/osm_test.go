@@ -56,7 +56,7 @@ func TestDownloadTile(t *testing.T) {
 		Url: osmServer.URL + "/{z}/{x}/{y}.{format}",
 	}
 
-	b, err := provider.downloadTile(0, 0, 0, Png)
+	b, err := provider.downloadTile(0, 0, 0, Png, map[string][]string{})
 
 	if err != nil {
 		t.Errorf("Cannot download tile. Cause: %s", err)
@@ -66,7 +66,7 @@ func TestDownloadTile(t *testing.T) {
 		t.Errorf("Returned bytes are not equal. Received %b but expected %b", b, payload)
 	}
 
-	_, err = provider.downloadTile(1, 1, 1, Jpg)
+	_, err = provider.downloadTile(1, 1, 1, Jpg, map[string][]string{})
 
 	if err == nil {
 		t.Errorf("Inexistent tile found. %s", err)
