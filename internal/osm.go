@@ -28,19 +28,25 @@ type Tile struct {
 	Bytes   []byte
 }
 
+type ConfigParam struct {
+	Name   string
+	Values []string
+}
+
 type Provider struct {
 	Url string
 	Dir string
 }
 
-func (o *Provider) GetTile(x int, y int, z int, format TileFormat) (*Tile, error) {
+func (o *Provider) GetTile(x int, y int, z int, format TileFormat, params ...*ConfigParam) (*Tile, error) {
 	tile, err := o.getTileFromDisk(x, y, z, format)
 
 	if err == nil {
 		return tile, nil
 	}
 
-	bytes, err := o.downloadTile(x, y, z, format)
+	paramsMap := convertConfigParamsToMap(params...)
+	bytes, err := o.downloadTile(x, y, z, format, paramsMap)
 
 	if err != nil {
 		log.Errorf("Cannot get tile from provider. Cause %s", err)
@@ -60,12 +66,22 @@ func (o *Provider) GetTile(x int, y int, z int, format TileFormat) (*Tile, error
 	return tile, nil
 }
 
-func (o *Provider) downloadTile(x int, y int, z int, format TileFormat) ([]byte, error) {
+func (o *Provider) downloadTile(x int, y int, z int, format TileFormat, params map[string][]string) ([]byte, error) {
 	uri := formatUrl(o.Url, x, y, z, format)
 
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", uri, nil)
 	req.Header.Set("User-Agent", getUserAgent())
+
+	q := req.URL.Query()
+
+	for key, value := range params {
+		for _, v := range value {
+			q.Add(key, v)
+		}
+	}
+
+	req.URL.RawQuery = q.Encode()
 
 	resp, err := client.Do(req)
 
@@ -156,4 +172,14 @@ func formatTileDirPath(dir string, x, z int) string {
 
 func getUserAgent() string {
 	return fmt.Sprintf("osm-cache (%s)", runtime.GOOS)
+}
+
+func convertConfigParamsToMap(params ...*ConfigParam) map[string][]string {
+	m := make(map[string][]string, len(params))
+
+	for _, p := range params {
+		m[p.Name] = p.Values
+	}
+
+	return m
 }
