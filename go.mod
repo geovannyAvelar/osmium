@@ -1,4 +1,4 @@
-module github.com/geovannyAvelar/osm-cache
+module osm-cache
 
 go 1.18
 

@@ -6,7 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/geovannyAvelar/osm-cache/internal"
+	"osm-cache/internal"
+
 	"github.com/go-chi/chi/v5"
 
 	log "github.com/sirupsen/logrus"
