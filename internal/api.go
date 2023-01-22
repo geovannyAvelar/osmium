@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/handlers"
@@ -35,6 +36,12 @@ type HttpApi struct {
 	Providers      map[string]Provider
 	BasePath       string
 	AllowedOrigins []string
+}
+
+type ProviderData struct {
+	Name        string `json:"name"`
+	UrlTemplate string `json:"url_template"`
+	Attribution string `json:"attribution"`
 }
 
 func (a *HttpApi) Run(port int) error {
@@ -110,11 +117,12 @@ func (a *HttpApi) handleTile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *HttpApi) listProviders(w http.ResponseWriter, r *http.Request) {
-	providerNames := make([]string, len(a.Providers))
+	providerNames := make([]ProviderData, len(a.Providers))
 
 	i := 0
-	for name := range a.Providers {
-		providerNames[i] = name
+	for name, value := range a.Providers {
+		url := fmt.Sprintf("%s%s/{z}/{x}/{y}.{format}", strings.ReplaceAll(a.BasePath, "/", ""), name)
+		providerNames[i] = ProviderData{Name: name, UrlTemplate: url, Attribution: value.Attribution}
 		i++
 	}
 

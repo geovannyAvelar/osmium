@@ -1,85 +1,29 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"strconv"
-	"strings"
-
 	"osm-cache/internal"
 
 	"github.com/go-chi/chi/v5"
-
-	log "github.com/sirupsen/logrus"
 )
 
 func main() {
 	osm := internal.Provider{
-		Url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-		Dir: "tiles/osm",
+		Url:         "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+		Dir:         internal.GetTilesPath() + "/osm",
+		Attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors",
+	}
+	arcgis := internal.Provider{
+		Url:         "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+		Dir:         internal.GetTilesPath() + "/arcgis",
+		Attribution: "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
 	}
 
 	api := internal.HttpApi{
 		Router:         chi.NewRouter(),
-		BasePath:       getRootPath(),
-		Providers:      map[string]internal.Provider{"osm": osm},
-		AllowedOrigins: getAllowedOrigins(),
+		BasePath:       internal.GetRootPath(),
+		Providers:      map[string]internal.Provider{"osm": osm, "arcgis": arcgis},
+		AllowedOrigins: internal.GetAllowedOrigins(),
 	}
 
-	api.Run(getApiPort())
-}
-
-func getAllowedOrigins() []string {
-	envVar := os.Getenv("OSM_CACHE_ALLOWED_ORIGINS")
-
-	if envVar != "" {
-		return strings.Split(envVar, ",")
-	}
-
-	log.Warn("OSM_CACHE_ALLOWED_ORIGINS enviroment variable is not defined. Accepting only local connections")
-
-	return []string{getLocalHost()}
-}
-
-func getApiPort() int {
-	envVar := os.Getenv("OSM_PORT")
-
-	if envVar != "" {
-		port, err := strconv.Atoi(envVar)
-
-		if err == nil {
-			return port
-		}
-
-		log.Warn("Cannot parse OSM_PORT enviroment variable. Port must be an integer.")
-	}
-
-	log.Warn("OSM_PORT is not defined.")
-	log.Warn("Using default port 8000.")
-
-	return 8000
-}
-
-func getLocalHost() string {
-	logLevel := log.GetLevel()
-
-	log.SetLevel(0)
-	port := getApiPort()
-	log.SetLevel(logLevel)
-
-	return fmt.Sprintf("http://localhost:%d", port)
-}
-
-func getRootPath() string {
-	root := os.Getenv("OSM_BASE_PATH")
-
-	if root != "" && len(root) > 0 {
-		if root[0] == '/' {
-			return root
-		}
-	}
-
-	log.Warn("OSM_BASE_PATH enviroment variable is not defined. Default is /")
-
-	return "/"
+	api.Run(internal.GetApiPort())
 }

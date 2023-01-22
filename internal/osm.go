@@ -34,8 +34,9 @@ type ConfigParam struct {
 }
 
 type Provider struct {
-	Url string
-	Dir string
+	Url         string
+	Dir         string
+	Attribution string
 }
 
 func (o *Provider) GetTile(x int, y int, z int, format TileFormat, params ...*ConfigParam) (*Tile, error) {
