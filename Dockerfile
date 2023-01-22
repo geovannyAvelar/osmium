@@ -7,7 +7,7 @@ COPY go.sum ./
 
 RUN go mod download
 
-COPY Makefile ./
+COPY internal/ internal/
 COPY *.go ./
 
 RUN go build -o osm-cache main.go
