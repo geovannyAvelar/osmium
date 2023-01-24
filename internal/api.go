@@ -82,15 +82,8 @@ func (a *HttpApi) handleTile(w http.ResponseWriter, r *http.Request) {
 	provider, err := a.getProviderByName(chi.URLParam(r, "provider"))
 
 	if err != nil {
-		i := 0
-		for _, p := range a.Providers {
-			if i > 0 {
-				break
-			}
-
-			provider = &p
-			i++
-		}
+		p := a.Providers["osm"]
+		provider = &p
 	}
 
 	format, err := a.getTileFormat(chi.URLParam(r, "format"))
