@@ -113,7 +113,7 @@ func (o *Provider) downloadTile(x int, y int, z int, format TileFormat, params m
 }
 
 func (o *Provider) saveTile(x int, y int, z int, format TileFormat, bytes []byte) (string, error) {
-	dir := formatTileDirPath(o.Dir, z, x)
+	dir := formatTileDirPath(o.Dir, x, z)
 	err := os.MkdirAll(dir, os.ModePerm)
 
 	if err != nil {
