@@ -120,7 +120,7 @@ func (o *Provider) saveTile(x int, y int, z int, format TileFormat, bytes []byte
 		return "", fmt.Errorf("cannot create directories to store tiles. Cause: %w", err)
 	}
 
-	filepath := fmt.Sprintf("%s/%d.png", dir, y)
+	filepath := fmt.Sprintf("%s/%d.%s", dir, y, format)
 
 	if _, err := os.Stat(filepath); err == nil {
 		return filepath, nil
