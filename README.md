@@ -1,4 +1,4 @@
-# OpenStreetMap Tiles Cache Server
+# Osmium
 
 This repository contains a small proxy server written in Go capable to cache OpenStreetMap 
 tiles in the disk and serve them without the need to reach OSM servers.

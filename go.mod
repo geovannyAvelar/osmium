@@ -1,4 +1,4 @@
-module osm-cache
+module osmium
 
 go 1.18
 

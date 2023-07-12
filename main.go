@@ -1,7 +1,7 @@
 package main
 
 import (
-	"osm-cache/internal"
+	"osmium/internal"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -21,11 +21,15 @@ func main() {
 		Url: "https://tile.nextzen.org/tilezen/terrain/v1/256/terrarium/{z}/{x}/{y}.png",
 		Dir: internal.GetTilesPath() + "/tilezen",
 	}
+	lukla := internal.Provider{
+		Url: "http://localhost:9000/64/{z}/{x}/{y}.png",
+		Dir: internal.GetTilesPath() + "/lukla",
+	}
 
 	api := internal.HttpApi{
 		Router:         chi.NewRouter(),
 		BasePath:       internal.GetRootPath(),
-		Providers:      map[string]internal.Provider{"osm": osm, "arcgis": arcgis, "tilezen": tilezen},
+		Providers:      map[string]internal.Provider{"osm": osm, "arcgis": arcgis, "tilezen": tilezen, "lukla": lukla},
 		AllowedOrigins: internal.GetAllowedOrigins(),
 	}
 
