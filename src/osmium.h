@@ -1,0 +1,19 @@
+#pragma once
+
+#include "osmium_compass.h"
+#include "osmium_map.h"
+#include "osmium_tile_layer.h"
+#include "osmium_wms_layer.h"
+#include "osmium_zoom_control.h"
+
+typedef enum {
+  OSMIUM_OK = 1,
+  OSMIUM_NULL_POINTER = -1,
+  OSMIUM_INVALID_BBOX = -2,
+  OSMIUM_URL_ERROR = -3,
+  OSMIUM_CACHE_ERROR = -4,
+  OSMIUM_NETWORK_ERROR = -5,
+  OSMIUM_PARSE_ERROR = -6,
+  OSMIUM_WMS_EXCEPTION = -7,
+  OSMIUM_OUT_OF_MEMORY = -8
+} osmium_error;
