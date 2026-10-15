@@ -77,3 +77,7 @@ All three have a `map` property that is set automatically when they are added as
 
 Respect the tile server's usage policy. The OSM one allows at most 2 connections;
 the pool size is `OSMIUM_TILE_LAYER_DOWNLOAD_THREADS` in `src/osmium_tile_layer.c`.
+
+## License
+
+LGPL-2.1-or-later. See `COPYING`.
