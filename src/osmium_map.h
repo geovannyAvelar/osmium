@@ -39,6 +39,8 @@ OSMIUM_API void osmium_map_set_bearing(OsmiumMap *self, double bearing);
 /* Overlays draw in the order added: add layers before controls.
  * Widgets with a "map" property get bound to it. Emits "view-changed" after each view change. */
 OSMIUM_API void osmium_map_add_overlay(OsmiumMap *self, GtkWidget *child);
+OSMIUM_API void osmium_map_insert_overlay(OsmiumMap *self, GtkWidget *child, int position);
+OSMIUM_API void osmium_map_move_overlay(OsmiumMap *self, GtkWidget *child, int position);
 OSMIUM_API void osmium_map_remove_overlay(OsmiumMap *self, GtkWidget *child);
 
 G_END_DECLS

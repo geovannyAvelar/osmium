@@ -18,3 +18,5 @@ typedef enum {
   OSMIUM_WMS_EXCEPTION = -7,
   OSMIUM_OUT_OF_MEMORY = -8
 } osmium_error;
+
+#include "wms/wms.h"

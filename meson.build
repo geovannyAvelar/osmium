@@ -46,6 +46,7 @@ libosmium = shared_library('osmium', osmium_sources,
 )
 
 install_headers(osmium_headers, subdir: 'osmium')
+install_headers('src/wms/wms.h', subdir: 'osmium/wms')
 
 pkg.generate(libosmium,
   name: 'osmium',

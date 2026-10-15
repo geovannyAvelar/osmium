@@ -12,6 +12,9 @@
 #define OSMIUM_TILE_LAYER_DOWNLOAD_THREADS 2
 #define OSMIUM_TILE_LAYER_DEFAULT_TEMPLATE_URL "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 #define OSMIUM_TILE_LAYER_DEFAULT_USER_AGENT "Osmium/0.1"
+#define OSMIUM_TILE_LAYER_KEEP_ZOOM_LEVELS 2
+#define OSMIUM_TILE_LAYER_IDLE_KEEP_LEVELS 1
+#define OSMIUM_TILE_LAYER_MAX_TILES 512
 
 typedef struct {
   GdkTexture *texture;
@@ -25,6 +28,7 @@ typedef struct {
   char *url_template;
   char *user_agent;
   char *path;
+  gboolean prefetch;
 } TileJob;
 
 struct _OsmiumTileLayer {
@@ -38,11 +42,14 @@ struct _OsmiumTileLayer {
   char *cache_folder;
 
   guint loaded_zoom;
+  guint pending;
   GHashTable *requested;
   GPtrArray *tiles;
   GThreadPool *pool;
   GCancellable *cancellable;
 };
+
+static void osmium_tile_layer_prefetch(OsmiumTileLayer *self);
 
 OSMIUM_API GType osmium_tile_layer_get_type(void);
 
@@ -120,12 +127,42 @@ static void osmium_layer_tile_free(gpointer data) {
   g_free(tile);
 }
 
+static void osmium_tile_layer_forget(OsmiumTileLayer *self, const OsmiumLayerTile *tile) {
+  char *key = g_strdup_printf("%u/%u/%u", tile->z, tile->x, tile->y);
+
+  g_hash_table_remove(self->requested, key);
+  g_free(key);
+}
+
+static void osmium_tile_layer_evict(OsmiumTileLayer *self, int max_distance) {
+  const int zoom = (int)osmium_map_get_zoom(self->map);
+
+  for (guint i = self->tiles->len; i > 0; i--) {
+    OsmiumLayerTile *tile = g_ptr_array_index(self->tiles, i - 1);
+
+    if (abs((int)tile->z - zoom) > max_distance) {
+      osmium_tile_layer_forget(self, tile);
+      g_ptr_array_remove_index_fast(self->tiles, i - 1);
+    }
+  }
+}
+
+static void osmium_tile_layer_trim(OsmiumTileLayer *self) {
+  const int keep = self->tiles->len > OSMIUM_TILE_LAYER_MAX_TILES ? 0 : OSMIUM_TILE_LAYER_IDLE_KEEP_LEVELS;
+
+  osmium_tile_layer_evict(self, keep);
+}
+
 static void on_tile_ready(GObject *source, GAsyncResult *result, gpointer user_data) {
   OsmiumTileLayer *self = OSMIUM_TILE_LAYER(source);
   TileJob *job = g_task_get_task_data(G_TASK(result));
   g_autoptr(GError) error = NULL;
 
   GdkTexture *texture = g_task_propagate_pointer(G_TASK(result), &error);
+
+  if (!job->prefetch && self->pending > 0) {
+    self->pending--;
+  }
 
   if (texture == NULL) {
     if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -134,7 +171,7 @@ static void on_tile_ready(GObject *source, GAsyncResult *result, gpointer user_d
     return;
   }
 
-  if (self->tiles == NULL || self->map == NULL || job->tile.z != osmium_map_get_zoom(self->map)) {
+  if (self->tiles == NULL || self->map == NULL) {
     g_object_unref(texture);
     return;
   }
@@ -145,7 +182,21 @@ static void on_tile_ready(GObject *source, GAsyncResult *result, gpointer user_d
   tile->y = job->tile.y;
   tile->z = job->tile.z;
 
-  g_ptr_array_add(self->tiles, tile);
+  if (abs((int)tile->z - (int)osmium_map_get_zoom(self->map)) > OSMIUM_TILE_LAYER_KEEP_ZOOM_LEVELS) {
+    osmium_tile_layer_forget(self, tile);
+    osmium_layer_tile_free(tile);
+  } else {
+    g_ptr_array_add(self->tiles, tile);
+  }
+
+  if (self->pending == 0) {
+    osmium_tile_layer_trim(self);
+
+    if (!job->prefetch) {
+      osmium_tile_layer_prefetch(self);
+    }
+  }
+
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
@@ -154,7 +205,38 @@ static void osmium_tile_layer_clear_tiles(OsmiumTileLayer *self) {
   g_hash_table_remove_all(self->requested);
 }
 
-static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
+static void osmium_tile_layer_request(OsmiumTileLayer *self, const osmium_tile *tile, gboolean prefetch) {
+  char *key = g_strdup_printf("%u/%u/%u", tile->z, tile->x, tile->y);
+  if (!g_hash_table_add(self->requested, key)) {
+    return;
+  }
+
+  char *path = osmium_tile_cache_path(self->cache_folder, tile);
+  if (path == NULL) {
+    return;
+  }
+
+  TileJob *job = g_new0(TileJob, 1);
+  job->tile = *tile;
+  job->prefetch = prefetch;
+  job->url_template = g_strdup(self->template_url);
+  job->user_agent = g_strdup(self->user_agent);
+  job->path = g_strdup(path);
+  free(path);
+
+  GTask *task = g_task_new(self, self->cancellable, on_tile_ready, NULL);
+  g_task_set_task_data(task, job, tile_job_free);
+
+  g_autoptr(GError) error = NULL;
+  if (!g_thread_pool_push(self->pool, task, &error)) {
+    g_warning("Could not queue tile: %s", error->message);
+    g_object_unref(task);
+  } else if (!prefetch) {
+    self->pending++;
+  }
+}
+
+static size_t osmium_tile_layer_view_tiles(OsmiumTileLayer *self, guint zoom, osmium_tile **tiles) {
   GtkWidget *widget = GTK_WIDGET(self);
   osmium_bbox bbox;
 
@@ -163,12 +245,11 @@ static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
 
   if (self->map == NULL || self->template_url == NULL || self->cache_folder == NULL ||
       width <= 0 || height <= 0) {
-    return;
+    return 0;
   }
 
   const double lat = osmium_map_get_lat(self->map);
   const double lon = osmium_map_get_lon(self->map);
-  const guint zoom = osmium_map_get_zoom(self->map);
   const double bearing = osmium_map_get_bearing(self->map);
 
   /* the rotated viewport needs the tiles under its axis-aligned bounding box */
@@ -178,15 +259,40 @@ static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
 
   if (!osmium_bbox_for_view(lat, lon, zoom, view_width, view_height, &bbox)) {
     g_warning("Invalid view: lat=%f lon=%f zoom=%u %dx%d", lat, lon, zoom, width, height);
+    return 0;
+  }
+
+  *tiles = NULL;
+  return tiles_for_bbox(bbox.lat_min, bbox.lon_min, bbox.lat_max, bbox.lon_max, zoom, tiles);
+}
+
+static void osmium_tile_layer_prefetch(OsmiumTileLayer *self) {
+  if (self->map == NULL) {
     return;
   }
 
+  const guint zoom = osmium_map_get_zoom(self->map);
   osmium_tile *tiles = NULL;
 
-  size_t count =
-      tiles_for_bbox(bbox.lat_min, bbox.lon_min, bbox.lat_max, bbox.lon_max, zoom, &tiles);
+  if (zoom == 0) {
+    return;
+  }
+
+  size_t count = osmium_tile_layer_view_tiles(self, zoom - 1, &tiles);
+
+  for (size_t i = 0; i < count; i++) {
+    osmium_tile_layer_request(self, &tiles[i], TRUE);
+  }
+
+  free(tiles);
+}
+
+static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
+  const guint zoom = self->map != NULL ? osmium_map_get_zoom(self->map) : 0;
+  osmium_tile *tiles = NULL;
+
+  size_t count = osmium_tile_layer_view_tiles(self, zoom, &tiles);
   if (count == 0) {
-    g_warning("No tiles to load for the current view");
     return;
   }
 
@@ -197,31 +303,22 @@ static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
   }
 
   for (size_t i = 0; i < count; i++) {
+    if (tiles[i].z == 0) {
+      continue;
+    }
+
     char *key = g_strdup_printf("%u/%u/%u", tiles[i].z, tiles[i].x, tiles[i].y);
-    if (!g_hash_table_add(self->requested, key)) {
-      continue;
+    const gboolean missing = !g_hash_table_contains(self->requested, key);
+    g_free(key);
+
+    if (missing) {
+      osmium_tile parent = {.x = tiles[i].x / 2, .y = tiles[i].y / 2, .z = tiles[i].z - 1};
+      osmium_tile_layer_request(self, &parent, FALSE);
     }
+  }
 
-    char *path = osmium_tile_cache_path(self->cache_folder, &tiles[i]);
-    if (path == NULL) {
-      continue;
-    }
-
-    TileJob *job = g_new0(TileJob, 1);
-    job->tile = tiles[i];
-    job->url_template = g_strdup(self->template_url);
-    job->user_agent = g_strdup(self->user_agent);
-    job->path = g_strdup(path);
-    free(path);
-
-    GTask *task = g_task_new(self, self->cancellable, on_tile_ready, NULL);
-    g_task_set_task_data(task, job, tile_job_free);
-
-    g_autoptr(GError) error = NULL;
-    if (!g_thread_pool_push(self->pool, task, &error)) {
-      g_warning("Could not queue tile: %s", error->message);
-      g_object_unref(task);
-    }
+  for (size_t i = 0; i < count; i++) {
+    osmium_tile_layer_request(self, &tiles[i], FALSE);
   }
 
   free(tiles);
@@ -232,11 +329,17 @@ static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
   const guint zoom = osmium_map_get_zoom(map);
 
   if (zoom != self->loaded_zoom) {
-    osmium_tile_layer_clear_tiles(self);
     self->loaded_zoom = zoom;
+    osmium_tile_layer_evict(self, OSMIUM_TILE_LAYER_KEEP_ZOOM_LEVELS);
   }
 
   osmium_tile_layer_load_tiles(self);
+
+  if (self->pending == 0) {
+    osmium_tile_layer_trim(self);
+    osmium_tile_layer_prefetch(self);
+  }
+
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
@@ -249,6 +352,13 @@ static void osmium_tile_layer_reload(OsmiumTileLayer *self) {
 
   osmium_tile_layer_load_tiles(self);
   gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+static gint compare_job_priority(gconstpointer a, gconstpointer b, gpointer user_data) {
+  const TileJob *job_a = g_task_get_task_data((GTask *)a);
+  const TileJob *job_b = g_task_get_task_data((GTask *)b);
+
+  return (gint)job_a->prefetch - (gint)job_b->prefetch;
 }
 
 static void osmium_tile_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
@@ -275,24 +385,31 @@ static void osmium_tile_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot)
   const double origin_x = round(center_x - width / 2.0) + width / 2.0;
   const double origin_y = round(center_y - height / 2.0) + height / 2.0;
 
-  /* rotated tiles need a 1px overlap, or anti-aliasing leaves seams */
-  const float tile_size = bearing == 0.0 ? 256.0f : 257.0f;
-
   gtk_snapshot_save(snapshot);
   gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(width / 2.0f, height / 2.0f));
   gtk_snapshot_rotate(snapshot, -(float)bearing);
 
-  for (guint i = 0; i < self->tiles->len; i++) {
-    OsmiumLayerTile *tile = g_ptr_array_index(self->tiles, i);
+  /* other zoom levels are only placeholders while tiles load; they stay cached for the next zoom */
+  const int max_distance = self->pending > 0 ? OSMIUM_TILE_LAYER_KEEP_ZOOM_LEVELS : 0;
 
-    if (tile->texture == NULL || tile->z != zoom) {
-      continue;
+  for (int distance = max_distance; distance >= 0; distance--) {
+    for (guint i = 0; i < self->tiles->len; i++) {
+      OsmiumLayerTile *tile = g_ptr_array_index(self->tiles, i);
+
+      if (tile->texture == NULL || abs((int)tile->z - (int)zoom) != distance) {
+        continue;
+      }
+
+      const double scale = ldexp(1.0, (int)zoom - (int)tile->z);
+      const double size = 256.0 * scale;
+      /* rotated or scaled tiles need a 1px overlap, or anti-aliasing leaves seams */
+      const double draw_size = (bearing == 0.0 && scale == 1.0) ? size : size + 1.0;
+
+      graphene_rect_t rect = GRAPHENE_RECT_INIT(
+          (double)tile->x * size - origin_x, (double)tile->y * size - origin_y, draw_size, draw_size);
+
+      gtk_snapshot_append_texture(snapshot, tile->texture, &rect);
     }
-
-    graphene_rect_t rect = GRAPHENE_RECT_INIT(
-        (double)tile->x * 256.0 - origin_x, (double)tile->y * 256.0 - origin_y, tile_size, tile_size);
-
-    gtk_snapshot_append_texture(snapshot, tile->texture, &rect);
   }
 
   gtk_snapshot_restore(snapshot);
@@ -514,6 +631,7 @@ static void osmium_tile_layer_init(OsmiumTileLayer *self) {
   self->cancellable = g_cancellable_new();
   self->pool =
       g_thread_pool_new(tile_worker, NULL, OSMIUM_TILE_LAYER_DOWNLOAD_THREADS, FALSE, NULL);
+  g_thread_pool_set_sort_function(self->pool, compare_job_priority, NULL);
 
   gtk_widget_set_can_target(widget, FALSE);
   gtk_widget_set_can_focus(widget, FALSE);

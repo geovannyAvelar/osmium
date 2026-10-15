@@ -47,11 +47,11 @@ typedef struct {
   char *content_type;
 } OsmiumWmsImage;
 
-osmium_error osmium_wms_get_map(const OsmiumWmsGetMapParams *params,
+OSMIUM_API osmium_error osmium_wms_get_map(const OsmiumWmsGetMapParams *params,
                                 const char *user_agent,
                                 OsmiumWmsImage *out);
-osmium_error osmium_wms_get_capabilities(const char *server_url,
+OSMIUM_API osmium_error osmium_wms_get_capabilities(const char *server_url,
                                          const char *user_agent,
                                          OsmiumWmsCapabilities **out);
-void osmium_wms_capabilities_free(OsmiumWmsCapabilities *caps);
-void osmium_wms_image_free(OsmiumWmsImage *image);
+OSMIUM_API void osmium_wms_capabilities_free(OsmiumWmsCapabilities *caps);
+OSMIUM_API void osmium_wms_image_free(OsmiumWmsImage *image);

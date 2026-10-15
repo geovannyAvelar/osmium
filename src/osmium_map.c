@@ -314,6 +314,29 @@ void osmium_map_add_overlay(OsmiumMap *self, GtkWidget *child) {
   }
 }
 
+void osmium_map_insert_overlay(OsmiumMap *self, GtkWidget *child, int position) {
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+  g_return_if_fail(GTK_IS_WIDGET(child));
+  g_return_if_fail(gtk_widget_get_parent(child) == NULL);
+
+  gtk_widget_set_parent(child, GTK_WIDGET(self));
+  self->overlays = g_list_insert(self->overlays, child, position);
+
+  GParamSpec *pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(child), "map");
+  if (pspec != NULL && g_type_is_a(OSMIUM_TYPE_MAP, pspec->value_type)) {
+    g_object_set(child, "map", self, NULL);
+  }
+}
+
+void osmium_map_move_overlay(OsmiumMap *self, GtkWidget *child, int position) {
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+  g_return_if_fail(g_list_find(self->overlays, child) != NULL);
+
+  self->overlays = g_list_remove(self->overlays, child);
+  self->overlays = g_list_insert(self->overlays, child, position);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
 void osmium_map_remove_overlay(OsmiumMap *self, GtkWidget *child) {
   g_return_if_fail(OSMIUM_IS_MAP(self));
   g_return_if_fail(g_list_find(self->overlays, child) != NULL);
