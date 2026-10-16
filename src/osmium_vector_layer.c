@@ -12,6 +12,7 @@
 #define OSMIUM_VECTOR_LAYER_MAX_SIZE 4096
 #define OSMIUM_VECTOR_LAYER_MARGIN 1.5
 #define OSMIUM_VECTOR_LAYER_MAX_THREADS 8
+#define OSMIUM_VECTOR_LAYER_MAX_HITS 50
 #define OSMIUM_VECTOR_LAYER_MIN_BAND_ROWS 64
 #define OSMIUM_VECTOR_LAYER_MIN_FEATURE_SIZE 0.5
 #define OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP 0.5
@@ -62,6 +63,8 @@ struct _OsmiumVectorLayer {
   guint generation;
   gboolean loading;
   OsmiumVectorData *data;
+  GArray *selection;
+  GArray *selected_indices;
   guint render_source;
   guint last_request_id;
   LayerImage *image;
@@ -93,6 +96,7 @@ enum { SIGNAL_LOAD_FAILED, N_SIGNALS };
 static guint signals[N_SIGNALS];
 
 static void render_now(OsmiumVectorLayer *self);
+static void rebuild_selected_indices(OsmiumVectorLayer *self);
 static void image_free(gpointer data);
 
 static void set_loading(OsmiumVectorLayer *self, gboolean loading) {
@@ -160,6 +164,7 @@ static void on_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
 
   osmium_vector_data_free(self->data);
   self->data = loaded;
+  rebuild_selected_indices(self);
 
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_N_FEATURES]);
   render_now(self);
@@ -171,6 +176,7 @@ static void start_load(OsmiumVectorLayer *self, gboolean keep_data) {
   if (!keep_data) {
     g_clear_pointer(&self->image, image_free);
     g_clear_pointer(&self->data, osmium_vector_data_free);
+    g_array_set_size(self->selected_indices, 0);
     g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_N_FEATURES]);
     gtk_widget_queue_draw(GTK_WIDGET(self));
   }
@@ -492,10 +498,104 @@ static void schedule_render(OsmiumVectorLayer *self) {
   self->render_source = g_timeout_add(OSMIUM_VECTOR_LAYER_RENDER_DELAY_MS, on_render_timeout, self);
 }
 
+static void append_selected_feature(GskPathBuilder *builder,
+                                   const OsmiumVectorFeature *f,
+                                   double scale,
+                                   double cx,
+                                   double cy,
+                                   double point_radius) {
+  for (size_t p = 0; p < f->n_parts; p++) {
+    const size_t start = f->part_start[p];
+    const size_t end = f->part_start[p + 1];
+
+    if (f->kind == OSMIUM_VECTOR_POINT) {
+      gsk_path_builder_add_circle(
+          builder,
+          &GRAPHENE_POINT_INIT((float)(f->xy[start * 2] * scale - cx),
+                               (float)(f->xy[start * 2 + 1] * scale - cy)),
+          (float)point_radius);
+      continue;
+    }
+
+    for (size_t i = start; i < end; i++) {
+      const float x = (float)(f->xy[i * 2] * scale - cx);
+      const float y = (float)(f->xy[i * 2 + 1] * scale - cy);
+
+      if (i == start) {
+        gsk_path_builder_move_to(builder, x, y);
+      } else {
+        gsk_path_builder_line_to(builder, x, y);
+      }
+    }
+
+    if (f->kind == OSMIUM_VECTOR_POLYGON) {
+      gsk_path_builder_close(builder);
+    }
+  }
+}
+
+static void draw_selection(OsmiumVectorLayer *self,
+                           GtkSnapshot *snapshot,
+                           float width,
+                           float height,
+                           double center_x,
+                           double center_y) {
+  static const GdkRGBA outline = {1.0f, 0.68f, 0.0f, 1.0f};
+  static const GdkRGBA fill = {1.0f, 0.68f, 0.0f, 0.35f};
+
+  if (self->data == NULL || self->selected_indices->len == 0) {
+    return;
+  }
+
+  const double scale = 256.0 * ldexp(1.0, (int)osmium_map_get_zoom(self->map));
+  GskPathBuilder *areas = gsk_path_builder_new();
+  GskPathBuilder *lines = gsk_path_builder_new();
+  GskPathBuilder *points = gsk_path_builder_new();
+
+  for (guint i = 0; i < self->selected_indices->len; i++) {
+    const OsmiumVectorFeature *f = &self->data->features[g_array_index(self->selected_indices, size_t, i)];
+    GskPathBuilder *target = f->kind == OSMIUM_VECTOR_POLYGON ? areas
+                             : f->kind == OSMIUM_VECTOR_LINE  ? lines
+                                                              : points;
+
+    append_selected_feature(target, f, scale, center_x, center_y, self->point_radius + 2.0);
+  }
+
+  GskPath *area_path = gsk_path_builder_free_to_path(areas);
+  GskPath *line_path = gsk_path_builder_free_to_path(lines);
+  GskPath *point_path = gsk_path_builder_free_to_path(points);
+  GskStroke *stroke = gsk_stroke_new(MAX((float)self->line_width + 1.5f, 3.0f));
+
+  gsk_stroke_set_line_join(stroke, GSK_LINE_JOIN_ROUND);
+  gsk_stroke_set_line_cap(stroke, GSK_LINE_CAP_ROUND);
+
+  gtk_snapshot_save(snapshot);
+  gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(width / 2.0f, height / 2.0f));
+  gtk_snapshot_rotate(snapshot, -(float)osmium_map_get_bearing(self->map));
+
+  if (!gsk_path_is_empty(area_path)) {
+    gtk_snapshot_append_fill(snapshot, area_path, GSK_FILL_RULE_EVEN_ODD, &fill);
+    gtk_snapshot_append_stroke(snapshot, area_path, stroke, &outline);
+  }
+  if (!gsk_path_is_empty(line_path)) {
+    gtk_snapshot_append_stroke(snapshot, line_path, stroke, &outline);
+  }
+  if (!gsk_path_is_empty(point_path)) {
+    gtk_snapshot_append_fill(snapshot, point_path, GSK_FILL_RULE_WINDING, &outline);
+  }
+
+  gtk_snapshot_restore(snapshot);
+
+  gsk_stroke_free(stroke);
+  gsk_path_unref(area_path);
+  gsk_path_unref(line_path);
+  gsk_path_unref(point_path);
+}
+
 static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
   OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(widget);
 
-  if (self->map == NULL || self->image == NULL) {
+  if (self->map == NULL || (self->image == NULL && self->selected_indices->len == 0)) {
     return;
   }
 
@@ -511,24 +611,252 @@ static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapsho
   osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
                      &center_y);
 
-  const double scale = ldexp(1.0, (int)zoom - (int)self->image->zoom);
+  if (self->image != NULL) {
+    const double scale = ldexp(1.0, (int)zoom - (int)self->image->zoom);
 
-  gtk_snapshot_save(snapshot);
-  gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(width / 2.0f, height / 2.0f));
-  gtk_snapshot_rotate(snapshot, -(float)bearing);
+    gtk_snapshot_save(snapshot);
+    gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(width / 2.0f, height / 2.0f));
+    gtk_snapshot_rotate(snapshot, -(float)bearing);
 
-  graphene_rect_t rect = GRAPHENE_RECT_INIT(self->image->x * scale - center_x,
-                                            self->image->y * scale - center_y,
-                                            self->image->width * scale,
-                                            self->image->height * scale);
-  gtk_snapshot_append_texture(snapshot, self->image->texture, &rect);
+    graphene_rect_t rect = GRAPHENE_RECT_INIT(self->image->x * scale - center_x,
+                                              self->image->y * scale - center_y,
+                                              self->image->width * scale,
+                                              self->image->height * scale);
+    gtk_snapshot_append_texture(snapshot, self->image->texture, &rect);
 
-  gtk_snapshot_restore(snapshot);
+    gtk_snapshot_restore(snapshot);
+  }
+
+  draw_selection(self, snapshot, width, height, center_x, center_y);
   gtk_snapshot_pop(snapshot);
 }
 
 static void osmium_vector_layer_size_allocate(GtkWidget *widget, int width, int height, int baseline) {
   schedule_render(OSMIUM_VECTOR_LAYER(widget));
+}
+
+void osmium_feature_field_free(OsmiumFeatureField *field) {
+  if (field == NULL) {
+    return;
+  }
+  g_free(field->name);
+  g_free(field->value);
+  g_free(field);
+}
+
+static void rebuild_selected_indices(OsmiumVectorLayer *self) {
+  g_array_set_size(self->selected_indices, 0);
+
+  if (self->data == NULL || self->selection->len == 0) {
+    return;
+  }
+
+  for (size_t i = 0; i < self->data->n_features; i++) {
+    for (guint s = 0; s < self->selection->len; s++) {
+      if (self->data->features[i].fid == g_array_index(self->selection, gint64, s)) {
+        g_array_append_val(self->selected_indices, i);
+        break;
+      }
+    }
+  }
+}
+
+GArray *osmium_vector_layer_identify(OsmiumVectorLayer *self,
+                                     double lat,
+                                     double lon,
+                                     double tolerance_px) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  GArray *result = g_array_new(FALSE, FALSE, sizeof(gint64));
+  long long fids[OSMIUM_VECTOR_LAYER_MAX_HITS];
+
+  if (self->map == NULL || self->data == NULL) {
+    return result;
+  }
+
+  const double x = (lon + 180.0) / 360.0;
+  const double rad = CLAMP(lat, -85.05112878, 85.05112878) * G_PI / 180.0;
+  const double y = (1.0 - log(tan(rad) + 1.0 / cos(rad)) / G_PI) / 2.0;
+  const double tolerance = tolerance_px / (256.0 * ldexp(1.0, (int)osmium_map_get_zoom(self->map)));
+
+  const size_t count = osmium_vector_data_hit_test(self->data, x, y, tolerance, fids,
+                                                   OSMIUM_VECTOR_LAYER_MAX_HITS);
+  for (size_t i = 0; i < count; i++) {
+    gint64 fid = fids[i];
+
+    g_array_append_val(result, fid);
+  }
+  return result;
+}
+
+GPtrArray *osmium_vector_layer_get_feature_attributes(OsmiumVectorLayer *self, gint64 fid) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  OsmiumVectorField *fields = NULL;
+  size_t n_fields = 0;
+
+  if (self->data == NULL ||
+      osmium_vector_data_get_attributes(self->data, fid, &fields, &n_fields) != OSMIUM_OK) {
+    return NULL;
+  }
+
+  GPtrArray *result = g_ptr_array_new_with_free_func((GDestroyNotify)osmium_feature_field_free);
+  for (size_t i = 0; i < n_fields; i++) {
+    OsmiumFeatureField *field = g_new0(OsmiumFeatureField, 1);
+
+    field->name = g_strdup(fields[i].name);
+    field->value = g_strdup(fields[i].value);
+    field->type = (OsmiumFeatureFieldType)fields[i].type;
+    field->width = fields[i].width;
+    g_ptr_array_add(result, field);
+  }
+
+  osmium_vector_fields_free(fields, n_fields);
+  return result;
+}
+
+gboolean osmium_vector_layer_is_editable(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  return self->data != NULL && osmium_vector_data_is_editable(self->data);
+}
+
+GPtrArray *osmium_vector_layer_get_fields(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  OsmiumVectorField *fields = NULL;
+  size_t n_fields = 0;
+
+  if (self->data == NULL ||
+      osmium_vector_data_get_fields(self->data, &fields, &n_fields) != OSMIUM_OK) {
+    return NULL;
+  }
+
+  GPtrArray *result = g_ptr_array_new_with_free_func((GDestroyNotify)osmium_feature_field_free);
+  for (size_t i = 0; i < n_fields; i++) {
+    OsmiumFeatureField *field = g_new0(OsmiumFeatureField, 1);
+
+    field->name = g_strdup(fields[i].name);
+    field->value = g_strdup("");
+    field->type = (OsmiumFeatureFieldType)fields[i].type;
+    field->width = fields[i].width;
+    g_ptr_array_add(result, field);
+  }
+
+  osmium_vector_fields_free(fields, n_fields);
+  return result;
+}
+
+static gboolean check_writable(OsmiumVectorLayer *self, GError **error) {
+  if (self->data == NULL || !osmium_vector_data_is_editable(self->data)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_READ_ONLY,
+                        "This layer is read-only (remote or not writable file)");
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean finish_write(OsmiumVectorLayer *self, osmium_error err, const char *message, GError **error) {
+  osmium_vector_data_release(self->data);
+
+  if (err != OSMIUM_OK) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, *message != '\0' ? message : "Could not write the file");
+    return FALSE;
+  }
+  return TRUE;
+}
+
+gboolean osmium_vector_layer_set_attributes(OsmiumVectorLayer *self,
+                                            const gint64 *fids,
+                                            const char *const *fields,
+                                            const char *const *values,
+                                            guint n_edits,
+                                            GError **error) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  char message[256] = "";
+
+  if (!check_writable(self, error)) {
+    return FALSE;
+  }
+
+  OsmiumVectorEdit *edits = g_new0(OsmiumVectorEdit, n_edits);
+  for (guint i = 0; i < n_edits; i++) {
+    edits[i].fid = fids[i];
+    edits[i].field = fields[i];
+    edits[i].value = values[i];
+  }
+
+  osmium_vector_data_release(self->data);
+  osmium_error err = osmium_vector_write_attributes(self->data->source_path, edits, n_edits, message, sizeof(message));
+  g_free(edits);
+  return finish_write(self, err, message, error);
+}
+
+gboolean osmium_vector_layer_add_field(OsmiumVectorLayer *self,
+                                       const char *name,
+                                       OsmiumFeatureFieldType type,
+                                       GError **error) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  char message[256] = "";
+
+  if (!check_writable(self, error)) {
+    return FALSE;
+  }
+
+  osmium_vector_data_release(self->data);
+  osmium_error err = osmium_vector_add_field(self->data->source_path, name, (OsmiumFieldType)type, message, sizeof(message));
+  return finish_write(self, err, message, error);
+}
+
+gboolean osmium_vector_layer_rename_field(OsmiumVectorLayer *self,
+                                          const char *old_name,
+                                          const char *new_name,
+                                          GError **error) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  char message[256] = "";
+
+  if (!check_writable(self, error)) {
+    return FALSE;
+  }
+
+  osmium_vector_data_release(self->data);
+  osmium_error err = osmium_vector_rename_field(self->data->source_path, old_name, new_name, message, sizeof(message));
+  return finish_write(self, err, message, error);
+}
+
+gboolean osmium_vector_layer_delete_field(OsmiumVectorLayer *self, const char *name, GError **error) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  char message[256] = "";
+
+  if (!check_writable(self, error)) {
+    return FALSE;
+  }
+
+  osmium_vector_data_release(self->data);
+  osmium_error err = osmium_vector_delete_field(self->data->source_path, name, message, sizeof(message));
+  return finish_write(self, err, message, error);
+}
+
+void osmium_vector_layer_set_selection(OsmiumVectorLayer *self, const gint64 *fids, guint n_fids) {
+  g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
+
+  g_array_set_size(self->selection, 0);
+  if (n_fids > 0) {
+    g_array_append_vals(self->selection, fids, n_fids);
+  }
+
+  rebuild_selected_indices(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+GArray *osmium_vector_layer_get_selection(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  return g_array_ref(self->selection);
 }
 
 OsmiumMap *osmium_vector_layer_get_map(OsmiumVectorLayer *self) {
@@ -733,6 +1061,8 @@ static void osmium_vector_layer_dispose(GObject *object) {
 
   g_clear_object(&self->cancellable);
   g_clear_pointer(&self->image, image_free);
+  g_clear_pointer(&self->selection, g_array_unref);
+  g_clear_pointer(&self->selected_indices, g_array_unref);
   g_clear_pointer(&self->data, osmium_vector_data_free);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
@@ -865,6 +1195,8 @@ static void osmium_vector_layer_init(OsmiumVectorLayer *self) {
   gdk_rgba_parse(&self->stroke_color, "#1c71d8");
   gdk_rgba_parse(&self->fill_color, "rgba(28, 113, 216, 0.35)");
   self->user_agent = g_strdup("Osmium/0.1");
+  self->selection = g_array_new(FALSE, FALSE, sizeof(gint64));
+  self->selected_indices = g_array_new(FALSE, FALSE, sizeof(size_t));
   self->line_width = OSMIUM_VECTOR_LAYER_DEFAULT_LINE_WIDTH;
   self->point_radius = OSMIUM_VECTOR_LAYER_DEFAULT_POINT_RADIUS;
   self->cancellable = g_cancellable_new();
