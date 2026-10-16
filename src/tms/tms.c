@@ -181,11 +181,12 @@ static char *expand_tile_url(const char *template, uint32_t x, uint32_t y, uint3
     return NULL;
   }
 
-  char char_z[16], char_x[16], char_y[16];
+  char char_z[16], char_x[16], char_y[16], char_flipped_y[16];
 
   snprintf(char_z, sizeof(char_z), "%u", z);
   snprintf(char_x, sizeof(char_x), "%u", x);
   snprintf(char_y, sizeof(char_y), "%u", y);
+  snprintf(char_flipped_y, sizeof(char_flipped_y), "%u", (uint32_t)((1u << z) - 1u - y));
 
   /* each 3-char placeholder expands to at most 10 digits */
   size_t capacity = strlen(template);
@@ -215,6 +216,9 @@ static char *expand_tile_url(const char *template, uint32_t x, uint32_t y, uint3
     } else if (strncmp(p, "{y}", 3) == 0) {
       replacement = char_y;
       p += 3;
+    } else if (strncmp(p, "{-y}", 4) == 0) {
+      replacement = char_flipped_y;
+      p += 4;
     } else {
       *out++ = *p++;
       continue;
