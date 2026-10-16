@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "vector_data.h"
+#include "vector_edit.h"
 
 #include <cpl_conv.h>
 #include <cpl_string.h>
@@ -26,6 +27,7 @@ typedef struct {
   size_t n_parts;
   size_t cap_parts;
   size_t *part_start;
+  unsigned char *roles;
 } Accumulator;
 
 static pthread_once_t gdal_once = PTHREAD_ONCE_INIT;
@@ -34,16 +36,24 @@ static void gdal_init(void) {
   GDALAllRegister();
 }
 
-static int acc_begin_part(Accumulator *acc) {
+static int acc_begin_part(Accumulator *acc, unsigned char role) {
   if (acc->n_parts + 2 > acc->cap_parts) {
     size_t cap = acc->cap_parts ? acc->cap_parts * 2 : 8;
     size_t *grown = realloc(acc->part_start, cap * sizeof(size_t));
-    if (!grown) {
+    unsigned char *roles = realloc(acc->roles, cap);
+
+    if (grown) {
+      acc->part_start = grown;
+    }
+    if (roles) {
+      acc->roles = roles;
+    }
+    if (!grown || !roles) {
       return 0;
     }
-    acc->part_start = grown;
     acc->cap_parts = cap;
   }
+  acc->roles[acc->n_parts] = role;
   acc->part_start[acc->n_parts++] = acc->n_points;
   return 1;
 }
@@ -90,13 +100,13 @@ static int kind_of(OGRGeometryH geom, OsmiumVectorKind *kind) {
   }
 }
 
-static int collect(OGRGeometryH geom, Accumulator *acc) {
+static int collect(OGRGeometryH geom, Accumulator *acc, unsigned char role) {
   switch (wkbFlatten(OGR_G_GetGeometryType(geom))) {
   case wkbPoint:
-    return acc_begin_part(acc) && acc_add_point(acc, OGR_G_GetX(geom, 0), OGR_G_GetY(geom, 0));
+    return acc_begin_part(acc, 0) && acc_add_point(acc, OGR_G_GetX(geom, 0), OGR_G_GetY(geom, 0));
   case wkbLineString:
   case wkbLinearRing:
-    if (!acc_begin_part(acc)) {
+    if (!acc_begin_part(acc, role)) {
       return 0;
     }
     for (int i = 0; i < OGR_G_GetPointCount(geom); i++) {
@@ -106,12 +116,18 @@ static int collect(OGRGeometryH geom, Accumulator *acc) {
     }
     return 1;
   case wkbPolygon:
+    for (int i = 0; i < OGR_G_GetGeometryCount(geom); i++) {
+      if (!collect(OGR_G_GetGeometryRef(geom, i), acc, i == 0 ? 0 : 1)) {
+        return 0;
+      }
+    }
+    return 1;
   case wkbMultiPoint:
   case wkbMultiLineString:
   case wkbMultiPolygon:
   case wkbGeometryCollection:
     for (int i = 0; i < OGR_G_GetGeometryCount(geom); i++) {
-      if (!collect(OGR_G_GetGeometryRef(geom, i), acc)) {
+      if (!collect(OGR_G_GetGeometryRef(geom, i), acc, 0)) {
         return 0;
       }
     }
@@ -123,6 +139,7 @@ static int collect(OGRGeometryH geom, Accumulator *acc) {
 
 static void feature_clear(OsmiumVectorFeature *f) {
   free(f->part_start);
+  free(f->part_role);
   free(f->ll);
   free(f->xy);
   memset(f, 0, sizeof(*f));
@@ -132,9 +149,10 @@ static int feature_from(OGRGeometryH geom, OsmiumVectorFeature *out) {
   Accumulator acc = {0};
   OsmiumVectorKind kind;
 
-  if (OGR_G_IsEmpty(geom) || !kind_of(geom, &kind) || !collect(geom, &acc) || acc.n_points == 0) {
+  if (OGR_G_IsEmpty(geom) || !kind_of(geom, &kind) || !collect(geom, &acc, 0) || acc.n_points == 0) {
     free(acc.xy);
     free(acc.part_start);
+    free(acc.roles);
     return 0;
   }
 
@@ -143,6 +161,7 @@ static int feature_from(OGRGeometryH geom, OsmiumVectorFeature *out) {
   out->kind = kind;
   out->n_parts = acc.n_parts;
   out->part_start = acc.part_start;
+  out->part_role = acc.roles;
   out->ll = acc.xy;
   out->xy = NULL;
   return 1;
@@ -352,6 +371,30 @@ static osmium_error read_dataset(GDALDatasetH dataset,
   vec->crs_ballpark = osmium_transform_is_ballpark(to_geographic);
   vec->crs_accuracy = osmium_transform_accuracy(to_geographic);
 
+  switch (wkbFlatten(OGR_L_GetGeomType(layer))) {
+  case wkbMultiPoint:
+    vec->geometry_multi = 1;
+    /* fall through */
+  case wkbPoint:
+    vec->geometry_kind = OSMIUM_VECTOR_POINT;
+    break;
+  case wkbMultiLineString:
+    vec->geometry_multi = 1;
+    /* fall through */
+  case wkbLineString:
+    vec->geometry_kind = OSMIUM_VECTOR_LINE;
+    break;
+  case wkbMultiPolygon:
+    vec->geometry_multi = 1;
+    /* fall through */
+  case wkbPolygon:
+    vec->geometry_kind = OSMIUM_VECTOR_POLYGON;
+    break;
+  default:
+    vec->geometry_kind = (OsmiumVectorKind)-1;
+    break;
+  }
+
   size_t cap = 0;
   osmium_error err = OSMIUM_OK;
 
@@ -391,6 +434,11 @@ static osmium_error read_dataset(GDALDatasetH dataset,
   }
 
   osmium_transform_free(to_geographic);
+  vec->cap_features = cap;
+  vec->next_temp_fid = -1;
+  if ((int)vec->geometry_kind < 0) {
+    vec->geometry_kind = vec->n_features > 0 ? vec->features[0].kind : OSMIUM_VECTOR_POLYGON;
+  }
 
   if (err == OSMIUM_OK) {
     err = osmium_vector_data_project(vec, projection);
@@ -457,6 +505,10 @@ osmium_error osmium_vector_data_project(OsmiumVectorData *vec, const OsmiumProje
 
   free(vec->projected_definition);
   vec->projected_definition = strdup(osmium_projection_get_definition(projection));
+  if (vec->projection) {
+    osmium_projection_unref(vec->projection);
+  }
+  vec->projection = osmium_projection_ref((OsmiumProjection *)projection);
   pthread_rwlock_unlock(&vec->xy_lock);
   return OSMIUM_OK;
 }
@@ -577,6 +629,9 @@ void osmium_vector_data_free(OsmiumVectorData *vec) {
     GDALClose(vec->dataset);
   }
   free(vec->projected_definition);
+  if (vec->projection) {
+    osmium_projection_unref(vec->projection);
+  }
   free(vec->crs_definition);
   free(vec->crs_name);
   free(vec->crs_code);
@@ -658,7 +713,7 @@ size_t osmium_vector_data_hit_test(const OsmiumVectorData *vec,
   for (size_t i = vec->n_features; i > 0 && count < max_fids; i--) {
     const OsmiumVectorFeature *f = &vec->features[i - 1];
 
-    if (x < f->min_x - tolerance || x > f->max_x + tolerance || y < f->min_y - tolerance ||
+    if (f->deleted || x < f->min_x - tolerance || x > f->max_x + tolerance || y < f->min_y - tolerance ||
         y > f->max_y + tolerance) {
       continue;
     }
@@ -1141,5 +1196,405 @@ osmium_error osmium_vector_delete_field(const char *path,
 
   OGR_L_SyncToDisk(layer);
   GDALClose(dataset);
+  return err;
+}
+
+void osmium_geometry_clear(OsmiumGeometry *geometry) {
+  if (!geometry) {
+    return;
+  }
+  free(geometry->ll);
+  free(geometry->part_start);
+  free(geometry->part_role);
+  memset(geometry, 0, sizeof(*geometry));
+}
+
+int osmium_geometry_copy(const OsmiumGeometry *from, OsmiumGeometry *to) {
+  memset(to, 0, sizeof(*to));
+  to->kind = from->kind;
+  to->n_points = from->n_points;
+  to->n_parts = from->n_parts;
+  to->ll = malloc((from->n_points ? from->n_points : 1) * 2 * sizeof(double));
+  to->part_start = malloc((from->n_parts + 1) * sizeof(size_t));
+  to->part_role = malloc(from->n_parts ? from->n_parts : 1);
+
+  if (!to->ll || !to->part_start || !to->part_role) {
+    osmium_geometry_clear(to);
+    return 0;
+  }
+
+  memcpy(to->ll, from->ll, from->n_points * 2 * sizeof(double));
+  memcpy(to->part_start, from->part_start, (from->n_parts + 1) * sizeof(size_t));
+  memcpy(to->part_role, from->part_role, from->n_parts);
+  return 1;
+}
+
+ptrdiff_t osmium_vector_data_find_fid(OsmiumVectorData *vec, long long fid) {
+  for (size_t i = 0; i < vec->n_features; i++) {
+    if (vec->features[i].fid == fid) {
+      return (ptrdiff_t)i;
+    }
+  }
+  return -1;
+}
+
+long long osmium_vector_data_new_fid(OsmiumVectorData *vec) {
+  return vec->next_temp_fid--;
+}
+
+int osmium_vector_data_copy_geometry(OsmiumVectorData *vec, size_t index, OsmiumGeometry *out) {
+  if (index >= vec->n_features) {
+    return 0;
+  }
+
+  const OsmiumVectorFeature *f = &vec->features[index];
+  OsmiumGeometry view = {.kind = f->kind,
+                         .ll = f->ll,
+                         .n_points = point_count(f),
+                         .part_start = f->part_start,
+                         .part_role = f->part_role,
+                         .n_parts = f->n_parts};
+
+  return osmium_geometry_copy(&view, out);
+}
+
+/* caller holds the write lock */
+static int store_geometry(OsmiumVectorData *vec, OsmiumVectorFeature *f, const OsmiumGeometry *g) {
+  double *ll = malloc((g->n_points ? g->n_points : 1) * 2 * sizeof(double));
+  double *xy = malloc((g->n_points ? g->n_points : 1) * 2 * sizeof(double));
+  size_t *part_start = malloc((g->n_parts + 1) * sizeof(size_t));
+  unsigned char *part_role = malloc(g->n_parts ? g->n_parts : 1);
+
+  if (!ll || !xy || !part_start || !part_role) {
+    free(ll);
+    free(xy);
+    free(part_start);
+    free(part_role);
+    return 0;
+  }
+
+  memcpy(ll, g->ll, g->n_points * 2 * sizeof(double));
+  memcpy(xy, g->ll, g->n_points * 2 * sizeof(double));
+  memcpy(part_start, g->part_start, (g->n_parts + 1) * sizeof(size_t));
+  memcpy(part_role, g->part_role, g->n_parts);
+
+  free(f->ll);
+  free(f->xy);
+  free(f->part_start);
+  free(f->part_role);
+  f->ll = ll;
+  f->xy = xy;
+  f->part_start = part_start;
+  f->part_role = part_role;
+  f->n_parts = g->n_parts;
+  f->kind = g->kind;
+
+  f->min_x = f->min_y = INFINITY;
+  f->max_x = f->max_y = -INFINITY;
+
+  if (vec->projection && osmium_projection_forward_many(vec->projection, f->xy, g->n_points) == 0) {
+    for (size_t i = 0; i < g->n_points; i++) {
+      f->min_x = fmin(f->min_x, f->xy[i * 2]);
+      f->max_x = fmax(f->max_x, f->xy[i * 2]);
+      f->min_y = fmin(f->min_y, f->xy[i * 2 + 1]);
+      f->max_y = fmax(f->max_y, f->xy[i * 2 + 1]);
+    }
+    vec->min_x = fmin(vec->min_x, f->min_x);
+    vec->max_x = fmax(vec->max_x, f->max_x);
+    vec->min_y = fmin(vec->min_y, f->min_y);
+    vec->max_y = fmax(vec->max_y, f->max_y);
+  }
+
+  for (size_t i = 0; i < g->n_points; i++) {
+    vec->lon_min = fmin(vec->lon_min, g->ll[i * 2]);
+    vec->lon_max = fmax(vec->lon_max, g->ll[i * 2]);
+    vec->lat_min = fmin(vec->lat_min, g->ll[i * 2 + 1]);
+    vec->lat_max = fmax(vec->lat_max, g->ll[i * 2 + 1]);
+  }
+  return 1;
+}
+
+int osmium_vector_data_set_geometry(OsmiumVectorData *vec, size_t index, const OsmiumGeometry *geometry) {
+  int ok = 0;
+
+  pthread_rwlock_wrlock(&vec->xy_lock);
+  if (index < vec->n_features) {
+    ok = store_geometry(vec, &vec->features[index], geometry);
+  }
+  pthread_rwlock_unlock(&vec->xy_lock);
+  return ok;
+}
+
+ptrdiff_t osmium_vector_data_append_feature(OsmiumVectorData *vec, long long fid, const OsmiumGeometry *geometry) {
+  ptrdiff_t index = -1;
+
+  pthread_rwlock_wrlock(&vec->xy_lock);
+
+  if (vec->n_features == vec->cap_features) {
+    size_t cap = vec->cap_features ? vec->cap_features * 2 : 16;
+    OsmiumVectorFeature *grown = realloc(vec->features, cap * sizeof(*grown));
+
+    if (grown) {
+      vec->features = grown;
+      vec->cap_features = cap;
+    }
+  }
+
+  if (vec->n_features < vec->cap_features) {
+    OsmiumVectorFeature *f = &vec->features[vec->n_features];
+
+    memset(f, 0, sizeof(*f));
+    f->fid = fid;
+    f->state = OSMIUM_FEATURE_NEW;
+    if (store_geometry(vec, f, geometry)) {
+      index = (ptrdiff_t)vec->n_features++;
+    } else {
+      feature_clear(f);
+    }
+  }
+
+  pthread_rwlock_unlock(&vec->xy_lock);
+  return index;
+}
+
+void osmium_vector_data_set_deleted(OsmiumVectorData *vec, size_t index, int deleted) {
+  pthread_rwlock_wrlock(&vec->xy_lock);
+  if (index < vec->n_features) {
+    vec->features[index].deleted = deleted;
+  }
+  pthread_rwlock_unlock(&vec->xy_lock);
+}
+
+void osmium_vector_data_set_state(OsmiumVectorData *vec, size_t index, int state) {
+  pthread_rwlock_wrlock(&vec->xy_lock);
+  if (index < vec->n_features) {
+    vec->features[index].state = state;
+  }
+  pthread_rwlock_unlock(&vec->xy_lock);
+}
+
+static OGRGeometryH make_point(double x, double y) {
+  OGRGeometryH point = OGR_G_CreateGeometry(wkbPoint);
+
+  OGR_G_SetPoint_2D(point, 0, x, y);
+  return point;
+}
+
+OGRGeometryH osmium_vector_build_geometry(const OsmiumVectorData *vec,
+                                          const OsmiumVectorFeature *f,
+                                          OsmiumTransform *transform) {
+  const size_t n = point_count(f);
+  double *xy = malloc((n ? n : 1) * 2 * sizeof(double));
+  OGRGeometryH result = NULL;
+
+  if (!xy) {
+    return NULL;
+  }
+  memcpy(xy, f->ll, n * 2 * sizeof(double));
+
+  if (transform && osmium_transform_apply(transform, xy, n) > 0) {
+    free(xy);
+    return NULL;
+  }
+
+  if (f->kind == OSMIUM_VECTOR_POINT) {
+    if (f->n_parts == 1 && !vec->geometry_multi) {
+      result = make_point(xy[0], xy[1]);
+    } else {
+      result = OGR_G_CreateGeometry(wkbMultiPoint);
+      for (size_t p = 0; p < f->n_parts; p++) {
+        OGR_G_AddGeometryDirectly(result, make_point(xy[f->part_start[p] * 2], xy[f->part_start[p] * 2 + 1]));
+      }
+    }
+  } else if (f->kind == OSMIUM_VECTOR_LINE) {
+    OGRGeometryH collection = OGR_G_CreateGeometry(wkbMultiLineString);
+
+    for (size_t p = 0; p < f->n_parts; p++) {
+      OGRGeometryH line = OGR_G_CreateGeometry(wkbLineString);
+
+      for (size_t i = f->part_start[p]; i < f->part_start[p + 1]; i++) {
+        OGR_G_AddPoint_2D(line, xy[i * 2], xy[i * 2 + 1]);
+      }
+      OGR_G_AddGeometryDirectly(collection, line);
+    }
+
+    if (f->n_parts == 1 && !vec->geometry_multi) {
+      result = OGR_G_Clone(OGR_G_GetGeometryRef(collection, 0));
+      OGR_G_DestroyGeometry(collection);
+    } else {
+      result = collection;
+    }
+  } else {
+    OGRGeometryH multi = OGR_G_CreateGeometry(wkbMultiPolygon);
+    OGRGeometryH polygon = NULL;
+    int polygons = 0;
+
+    for (size_t p = 0; p < f->n_parts; p++) {
+      OGRGeometryH ring = OGR_G_CreateGeometry(wkbLinearRing);
+
+      if (f->part_role[p] == 0 || polygon == NULL) {
+        if (polygon) {
+          OGR_G_AddGeometryDirectly(multi, polygon);
+        }
+        polygon = OGR_G_CreateGeometry(wkbPolygon);
+        polygons++;
+      }
+
+      for (size_t i = f->part_start[p]; i < f->part_start[p + 1]; i++) {
+        OGR_G_AddPoint_2D(ring, xy[i * 2], xy[i * 2 + 1]);
+      }
+      OGR_G_CloseRings(ring);
+      OGR_G_AddGeometryDirectly(polygon, ring);
+    }
+    if (polygon) {
+      OGR_G_AddGeometryDirectly(multi, polygon);
+    }
+
+    if (polygons == 1 && !vec->geometry_multi) {
+      result = OGR_G_Clone(OGR_G_GetGeometryRef(multi, 0));
+      OGR_G_DestroyGeometry(multi);
+    } else {
+      result = multi;
+    }
+  }
+
+  free(xy);
+  return result;
+}
+
+static int apply_overrides(const OsmiumEditSession *session,
+                           OGRFeatureH feature,
+                           OGRFeatureDefnH defn,
+                           long long fid,
+                           char *message,
+                           size_t message_size) {
+  for (size_t i = 0; i < session->n_overrides; i++) {
+    const OsmiumAttributeOverride *entry = &session->overrides[i];
+    const int index = entry->fid == fid ? OGR_FD_GetFieldIndex(defn, entry->field) : -1;
+
+    if (index < 0) {
+      continue;
+    }
+    if (!check_value(OGR_FD_GetFieldDefn(defn, index), entry->field, entry->value, message, message_size)) {
+      return 0;
+    }
+    store_value(feature, index, OGR_FD_GetFieldDefn(defn, index), entry->value);
+  }
+  return 1;
+}
+
+osmium_error osmium_edit_save(OsmiumEditSession *session, char *message, size_t message_size) {
+  OsmiumVectorData *vec = session->data;
+  OGRLayerH layer = NULL;
+  osmium_error err = OSMIUM_OK;
+  int deleted_any = 0;
+
+  if (!vec->source_path) {
+    set_message(message, message_size, "This layer has no file to write to%s%s", "", "");
+    return OSMIUM_FILE_ERROR;
+  }
+
+  osmium_vector_data_release(vec);
+  GDALDatasetH dataset = open_for_update(vec->source_path, &layer, message, message_size);
+  if (!dataset) {
+    return OSMIUM_FILE_ERROR;
+  }
+
+  OGRFeatureDefnH defn = OGR_L_GetLayerDefn(layer);
+  const double area[4] = {vec->lon_min, vec->lat_min, vec->lon_max, vec->lat_max};
+  OsmiumTransform *transform = osmium_transform_new("EPSG:4326", vec->crs_definition, isfinite(area[0]) ? area : NULL, NULL, 0);
+
+  if (!transform) {
+    GDALClose(dataset);
+    set_message(message, message_size, "No transformation back to the file's coordinate system%s%s", "", "");
+    return OSMIUM_CRS_ERROR;
+  }
+
+  const int transaction = OGR_L_StartTransaction(layer) == OGRERR_NONE;
+
+  for (size_t i = 0; i < vec->n_features && err == OSMIUM_OK; i++) {
+    OsmiumVectorFeature *f = &vec->features[i];
+    int has_override = 0;
+
+    for (size_t o = 0; o < session->n_overrides; o++) {
+      has_override |= session->overrides[o].fid == f->fid;
+    }
+
+    if (f->deleted) {
+      if (f->fid >= 0 && OGR_L_DeleteFeature(layer, f->fid) != OGRERR_NONE) {
+        set_message(message, message_size, "Could not delete a feature: %s%s", CPLGetLastErrorMsg(), "");
+        err = OSMIUM_FILE_ERROR;
+      } else if (f->fid >= 0) {
+        deleted_any = 1;
+      }
+      continue;
+    }
+
+    if (f->state == OSMIUM_FEATURE_CLEAN && !has_override) {
+      continue;
+    }
+
+    OGRFeatureH feature = f->state == OSMIUM_FEATURE_NEW ? OGR_F_Create(defn) : OGR_L_GetFeature(layer, f->fid);
+
+    if (!feature) {
+      set_message(message, message_size, "A feature no longer exists in the file%s%s", "", "");
+      err = OSMIUM_FILE_ERROR;
+      break;
+    }
+
+    if (f->state != OSMIUM_FEATURE_CLEAN) {
+      OGRGeometryH geometry = osmium_vector_build_geometry(vec, f, transform);
+
+      if (!geometry) {
+        set_message(message, message_size, "A geometry can't be converted back to the file's coordinate system%s%s", "", "");
+        OGR_F_Destroy(feature);
+        err = OSMIUM_CRS_ERROR;
+        break;
+      }
+      OGR_F_SetGeometryDirectly(feature, geometry);
+    }
+
+    if (!apply_overrides(session, feature, defn, f->fid, message, message_size)) {
+      OGR_F_Destroy(feature);
+      err = OSMIUM_FILE_ERROR;
+      break;
+    }
+
+    const OGRErr write = f->state == OSMIUM_FEATURE_NEW ? OGR_L_CreateFeature(layer, feature)
+                                                          : OGR_L_SetFeature(layer, feature);
+
+    if (write != OGRERR_NONE) {
+      set_message(message, message_size, "Could not write a feature: %s%s", CPLGetLastErrorMsg(), "");
+      err = OSMIUM_FILE_ERROR;
+    }
+    OGR_F_Destroy(feature);
+  }
+
+  osmium_transform_free(transform);
+
+  if (transaction) {
+    if (err == OSMIUM_OK) {
+      if (OGR_L_CommitTransaction(layer) != OGRERR_NONE) {
+        set_message(message, message_size, "Could not commit the changes: %s%s", CPLGetLastErrorMsg(), "");
+        err = OSMIUM_FILE_ERROR;
+      }
+    } else {
+      OGR_L_RollbackTransaction(layer);
+    }
+  }
+
+  if (err == OSMIUM_OK && deleted_any && is_shapefile(dataset)) {
+    char sql[256];
+
+    snprintf(sql, sizeof(sql), "REPACK %s", OGR_L_GetName(layer));
+    GDALDatasetExecuteSQL(dataset, sql, NULL, NULL);
+  }
+
+  OGR_L_SyncToDisk(layer);
+  GDALClose(dataset);
+
+  if (err == OSMIUM_OK) {
+    osmium_edit_session_clear(session);
+  }
   return err;
 }

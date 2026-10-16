@@ -52,6 +52,22 @@ OSMIUM_API void osmium_map_world_to_lonlat(OsmiumMap *self, double px, double py
 /* Normalized map coordinates (0..1 over the nominal world) to CRS units. */
 OSMIUM_API void osmium_map_normalized_to_units(OsmiumMap *self, double nx, double ny, double *x, double *y);
 
+/* While captured, the primary button and the keyboard go to the "tool-event" and "tool-key"
+ * signals (whose handlers return TRUE when they used the event) and dragging no longer pans; use
+ * the middle button to pan. */
+typedef enum {
+  OSMIUM_TOOL_PRESS,
+  OSMIUM_TOOL_MOTION,
+  OSMIUM_TOOL_RELEASE
+} OsmiumToolEventType;
+
+OSMIUM_API gboolean osmium_map_get_captured(OsmiumMap *self);
+OSMIUM_API void osmium_map_set_captured(OsmiumMap *self, gboolean captured);
+
+/* Normalized map coordinates are CRS coordinates scaled so the world spans 0..1, y down. */
+OSMIUM_API void osmium_map_widget_to_normalized(OsmiumMap *self, double x, double y, double *nx, double *ny);
+OSMIUM_API void osmium_map_normalized_to_widget(OsmiumMap *self, double nx, double ny, double *x, double *y);
+
 OSMIUM_API void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *lat, double *lon);
 
 OSMIUM_API void osmium_map_add_overlay(OsmiumMap *self, GtkWidget *child);

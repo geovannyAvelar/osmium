@@ -20,14 +20,42 @@ typedef struct {
   double min_x, min_y, max_x, max_y;
   size_t n_parts;
   size_t *part_start;
+  unsigned char *part_role;
   double *ll;
   double *xy;
+  int state;
+  int deleted;
 } OsmiumVectorFeature;
+
+/* A geometry as lon/lat vertices (WGS 84). Parts are lines/rings/points; a ring is closed (first
+ * vertex repeated at the end) and part_role is 0 for an exterior ring, line or point and 1 for a hole. */
+typedef struct {
+  OsmiumVectorKind kind;
+  double *ll;
+  size_t n_points;
+  size_t *part_start;
+  unsigned char *part_role;
+  size_t n_parts;
+} OsmiumGeometry;
+
+void osmium_geometry_clear(OsmiumGeometry *geometry);
+int osmium_geometry_copy(const OsmiumGeometry *from, OsmiumGeometry *to);
+
+typedef enum {
+  OSMIUM_FEATURE_CLEAN,
+  OSMIUM_FEATURE_NEW,
+  OSMIUM_FEATURE_MODIFIED
+} OsmiumFeatureState;
 
 typedef struct {
   atomic_int refs;
   OsmiumVectorFeature *features;
   size_t n_features;
+  size_t cap_features;
+  OsmiumVectorKind geometry_kind;
+  int geometry_multi;
+  long long next_temp_fid;
+  OsmiumProjection *projection;
   double min_x, min_y, max_x, max_y;
   double lon_min, lat_min, lon_max, lat_max;
 
@@ -134,3 +162,16 @@ osmium_error osmium_vector_delete_field(const char *path,
                                         const char *name,
                                         char *message,
                                         size_t message_size);
+
+/* --- editing in memory (see vector_edit.h for the undoable layer on top) --- */
+
+ptrdiff_t osmium_vector_data_find_fid(OsmiumVectorData *vec, long long fid);
+long long osmium_vector_data_new_fid(OsmiumVectorData *vec);
+
+/* Deep copy of the feature's lon/lat geometry. Returns 0 when index is invalid. */
+int osmium_vector_data_copy_geometry(OsmiumVectorData *vec, size_t index, OsmiumGeometry *out);
+
+int osmium_vector_data_set_geometry(OsmiumVectorData *vec, size_t index, const OsmiumGeometry *geometry);
+ptrdiff_t osmium_vector_data_append_feature(OsmiumVectorData *vec, long long fid, const OsmiumGeometry *geometry);
+void osmium_vector_data_set_deleted(OsmiumVectorData *vec, size_t index, int deleted);
+void osmium_vector_data_set_state(OsmiumVectorData *vec, size_t index, int state);

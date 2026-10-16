@@ -28,6 +28,10 @@ struct _OsmiumMap {
   double drag_last_y;
   double press_x;
   double press_y;
+  gboolean captured;
+  gboolean button_down;
+  double drag_start_x;
+  double drag_start_y;
 };
 
 OSMIUM_API GType osmium_map_get_type(void);
@@ -55,11 +59,11 @@ G_DEFINE_TYPE_WITH_CODE(OsmiumMap,
                         GTK_TYPE_WIDGET,
                         G_IMPLEMENT_INTERFACE(GTK_TYPE_BUILDABLE, osmium_map_buildable_init))
 
-enum { PROP_0, PROP_LAT, PROP_LON, PROP_ZOOM, PROP_BEARING, PROP_CRS, N_PROPS };
+enum { PROP_0, PROP_LAT, PROP_LON, PROP_ZOOM, PROP_BEARING, PROP_CRS, PROP_CAPTURED, N_PROPS };
 
 #define OSMIUM_MAP_CLICK_SLOP 5.0
 
-enum { SIGNAL_VIEW_CHANGED, SIGNAL_MAP_CLICKED, N_SIGNALS };
+enum { SIGNAL_VIEW_CHANGED, SIGNAL_MAP_CLICKED, SIGNAL_TOOL_EVENT, SIGNAL_TOOL_KEY, N_SIGNALS };
 
 static GParamSpec *properties[N_PROPS];
 static guint signals[N_SIGNALS];
@@ -108,8 +112,8 @@ static void osmium_map_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
 
   const float pad_x = 10.0f;
   const float pad_y = 4.0f;
-  const float box_x = (width - text_width) / 2.0f - pad_x;
-  const float box_y = 8.0f;
+  const float box_x = 8.0f;
+  const float box_y = gtk_widget_get_height(widget) - text_height - 2 * pad_y - 8.0f;
 
   GdkRGBA backdrop = {0.0f, 0.0f, 0.0f, 0.6f};
   graphene_rect_t box =
@@ -182,6 +186,38 @@ void osmium_map_world_to_lonlat(OsmiumMap *self, double px, double py, guint zoo
   }
 }
 
+void osmium_map_widget_to_normalized(OsmiumMap *self, double x, double y, double *nx, double *ny) {
+  double cx, cy;
+
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  const double dx = x - gtk_widget_get_width(GTK_WIDGET(self)) / 2.0;
+  const double dy = y - gtk_widget_get_height(GTK_WIDGET(self)) / 2.0;
+  const double rad = self->bearing * G_PI / 180.0;
+  const double size = world_size(self->zoom);
+
+  osmium_map_lonlat_to_world(self, self->lat, self->lon, self->zoom, &cx, &cy);
+  *nx = (cx + dx * cos(rad) - dy * sin(rad)) / size;
+  *ny = (cy + dx * sin(rad) + dy * cos(rad)) / size;
+}
+
+void osmium_map_normalized_to_widget(OsmiumMap *self, double nx, double ny, double *x, double *y) {
+  double cx, cy;
+
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  const double rad = self->bearing * G_PI / 180.0;
+  const double size = world_size(self->zoom);
+
+  osmium_map_lonlat_to_world(self, self->lat, self->lon, self->zoom, &cx, &cy);
+
+  const double wx = nx * size - cx;
+  const double wy = ny * size - cy;
+
+  *x = gtk_widget_get_width(GTK_WIDGET(self)) / 2.0 + wx * cos(rad) + wy * sin(rad);
+  *y = gtk_widget_get_height(GTK_WIDGET(self)) / 2.0 - wx * sin(rad) + wy * cos(rad);
+}
+
 void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *lat, double *lon) {
   double cx, cy;
 
@@ -197,8 +233,32 @@ void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *la
   osmium_map_world_to_lonlat(self, cx + world_dx, cy + world_dy, self->zoom, lat, lon);
 }
 
+static gboolean emit_tool_event(OsmiumMap *self, guint type, double x, double y, guint button, guint state, int n_press) {
+  gboolean handled = FALSE;
+
+  g_signal_emit(self, signals[SIGNAL_TOOL_EVENT], 0, type, x, y, button, state, n_press, &handled);
+  return handled;
+}
+
+static gboolean over_child(OsmiumMap *self, double x, double y) {
+  GtkWidget *picked = gtk_widget_pick(GTK_WIDGET(self), x, y, GTK_PICK_DEFAULT);
+
+  return picked != NULL && picked != GTK_WIDGET(self);
+}
+
 static void on_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
   OsmiumMap *self = OSMIUM_MAP(user_data);
+
+  if (self->captured) {
+    if (over_child(self, x, y)) {
+      return;
+    }
+    gtk_widget_grab_focus(GTK_WIDGET(self));
+    self->button_down = TRUE;
+    emit_tool_event(self, OSMIUM_TOOL_PRESS, x, y, GDK_BUTTON_PRIMARY,
+                    gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture)), n_press);
+    return;
+  }
 
   self->press_x = x;
   self->press_y = y;
@@ -210,6 +270,10 @@ static void on_click_released(GtkGestureClick *gesture, int n_press, double x, d
   GdkModifierType state =
       gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
   double lat, lon;
+
+  if (self->captured) {
+    return;
+  }
 
   if (n_press != 1 || hypot(x - self->press_x, y - self->press_y) > OSMIUM_MAP_CLICK_SLOP) {
     return;
@@ -237,6 +301,15 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller,
                                gpointer user_data) {
   OsmiumMap *self = OSMIUM_MAP(user_data);
   const double step = (state & GDK_SHIFT_MASK) ? OSMIUM_MAP_PAN_STEP * 4 : OSMIUM_MAP_PAN_STEP;
+
+  if (self->captured) {
+    gboolean handled = FALSE;
+
+    g_signal_emit(self, signals[SIGNAL_TOOL_KEY], 0, keyval, (guint)state, &handled);
+    if (handled) {
+      return GDK_EVENT_STOP;
+    }
+  }
 
   switch (keyval) {
   case GDK_KEY_Left:
@@ -292,11 +365,17 @@ on_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer u
   return GDK_EVENT_STOP;
 }
 
+static gboolean drag_pans(OsmiumMap *self, GtkGestureDrag *gesture) {
+  return !self->captured || gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture)) != GDK_BUTTON_PRIMARY;
+}
+
 static void on_drag_begin(GtkGestureDrag *gesture, double x, double y, gpointer user_data) {
   OsmiumMap *self = OSMIUM_MAP(user_data);
 
   self->drag_last_x = 0;
   self->drag_last_y = 0;
+  self->drag_start_x = x;
+  self->drag_start_y = y;
   gtk_widget_grab_focus(GTK_WIDGET(self));
 }
 
@@ -304,12 +383,45 @@ static void
 on_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, gpointer user_data) {
   OsmiumMap *self = OSMIUM_MAP(user_data);
 
+  if (!drag_pans(self, gesture)) {
+    if (!self->button_down) {
+      return;
+    }
+    emit_tool_event(self, OSMIUM_TOOL_MOTION, self->drag_start_x + offset_x, self->drag_start_y + offset_y,
+                    GDK_BUTTON_PRIMARY,
+                    gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture)), 0);
+    return;
+  }
+
   osmium_map_pan(self, self->drag_last_x - offset_x, self->drag_last_y - offset_y);
 
   self->drag_last_x = offset_x;
   self->drag_last_y = offset_y;
 
   osmium_map_view_changed(self);
+}
+
+static void on_drag_end(GtkGestureDrag *gesture, double offset_x, double offset_y, gpointer user_data) {
+  OsmiumMap *self = OSMIUM_MAP(user_data);
+
+  if (!drag_pans(self, gesture)) {
+    if (!self->button_down) {
+      return;
+    }
+    self->button_down = FALSE;
+    emit_tool_event(self, OSMIUM_TOOL_RELEASE, self->drag_start_x + offset_x, self->drag_start_y + offset_y,
+                    GDK_BUTTON_PRIMARY,
+                    gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture)), 0);
+  }
+}
+
+static void on_hover(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {
+  OsmiumMap *self = OSMIUM_MAP(user_data);
+
+  if (self->captured && !self->button_down && !over_child(self, x, y)) {
+    emit_tool_event(self, OSMIUM_TOOL_MOTION, x, y, 0,
+                    gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller)), 0);
+  }
 }
 
 void osmium_map_set_view(OsmiumMap *self, double lat, double lon, guint zoom) {
@@ -370,6 +482,24 @@ void osmium_map_set_bearing(OsmiumMap *self, double bearing) {
   self->bearing = bearing;
 
   osmium_map_view_changed(self);
+}
+
+gboolean osmium_map_get_captured(OsmiumMap *self) {
+  g_return_val_if_fail(OSMIUM_IS_MAP(self), FALSE);
+
+  return self->captured;
+}
+
+void osmium_map_set_captured(OsmiumMap *self, gboolean captured) {
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  if (self->captured == captured) {
+    return;
+  }
+
+  self->captured = captured;
+  self->button_down = FALSE;
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_CAPTURED]);
 }
 
 OsmiumProjection *osmium_map_get_projection(OsmiumMap *self) {
@@ -490,6 +620,9 @@ static void osmium_map_set_property(GObject *object,
   case PROP_BEARING:
     osmium_map_set_bearing(self, g_value_get_double(value));
     break;
+  case PROP_CAPTURED:
+    osmium_map_set_captured(self, g_value_get_boolean(value));
+    break;
   case PROP_CRS:
     if (g_value_get_string(value) != NULL && !osmium_map_set_crs(self, g_value_get_string(value))) {
       g_warning("Unknown coordinate system %s", g_value_get_string(value));
@@ -518,6 +651,9 @@ static void osmium_map_get_property(GObject *object,
     break;
   case PROP_CRS:
     g_value_set_string(value, self->crs);
+    break;
+  case PROP_CAPTURED:
+    g_value_set_boolean(value, self->captured);
     break;
   case PROP_BEARING:
     g_value_set_double(value, self->bearing);
@@ -552,6 +688,10 @@ static void osmium_map_class_init(OsmiumMapClass *klass) {
       "crs", NULL, "Coordinate system the map is drawn in (EPSG:3857 by default)", "EPSG:3857",
       G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
 
+  properties[PROP_CAPTURED] = g_param_spec_boolean(
+      "captured", NULL, "Whether pointer events go to the active editing tool instead of panning", FALSE,
+      G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
+
   g_object_class_install_properties(object_class, N_PROPS, properties);
 
   signals[SIGNAL_VIEW_CHANGED] = g_signal_new("view-changed",
@@ -562,6 +702,13 @@ static void osmium_map_class_init(OsmiumMapClass *klass) {
   signals[SIGNAL_MAP_CLICKED] = g_signal_new("map-clicked", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
                                              NULL, NULL, NULL, G_TYPE_NONE, 3, G_TYPE_DOUBLE,
                                              G_TYPE_DOUBLE, G_TYPE_UINT);
+  signals[SIGNAL_TOOL_EVENT] = g_signal_new("tool-event", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
+                                            g_signal_accumulator_true_handled, NULL, NULL, G_TYPE_BOOLEAN, 6,
+                                            G_TYPE_UINT, G_TYPE_DOUBLE, G_TYPE_DOUBLE, G_TYPE_UINT, G_TYPE_UINT,
+                                            G_TYPE_INT);
+  signals[SIGNAL_TOOL_KEY] = g_signal_new("tool-key", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
+                                          g_signal_accumulator_true_handled, NULL, NULL, G_TYPE_BOOLEAN, 2,
+                                          G_TYPE_UINT, G_TYPE_UINT);
   widget_class->snapshot = osmium_map_snapshot;
   widget_class->size_allocate = osmium_map_size_allocate;
 }
@@ -597,7 +744,18 @@ static void osmium_map_init(OsmiumMap *self) {
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(drag), GDK_BUTTON_PRIMARY);
   g_signal_connect(drag, "drag-begin", G_CALLBACK(on_drag_begin), self);
   g_signal_connect(drag, "drag-update", G_CALLBACK(on_drag_update), self);
+  g_signal_connect(drag, "drag-end", G_CALLBACK(on_drag_end), self);
   gtk_widget_add_controller(GTK_WIDGET(self), GTK_EVENT_CONTROLLER(drag));
+
+  GtkGesture *pan = gtk_gesture_drag_new();
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(pan), GDK_BUTTON_MIDDLE);
+  g_signal_connect(pan, "drag-begin", G_CALLBACK(on_drag_begin), self);
+  g_signal_connect(pan, "drag-update", G_CALLBACK(on_drag_update), self);
+  gtk_widget_add_controller(GTK_WIDGET(self), GTK_EVENT_CONTROLLER(pan));
+
+  GtkEventController *hover = gtk_event_controller_motion_new();
+  g_signal_connect(hover, "motion", G_CALLBACK(on_hover), self);
+  gtk_widget_add_controller(GTK_WIDGET(self), hover);
 
   gtk_widget_set_overflow(GTK_WIDGET(self), GTK_OVERFLOW_HIDDEN);
   gtk_widget_set_size_request(GTK_WIDGET(self), 200, 100);

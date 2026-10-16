@@ -23,6 +23,7 @@ osmium_sources = [
   'src/osmium_crs.c',
   'src/osmium_map.c',
   'src/osmium_raster_layer.c',
+  'src/osmium_vector_editor.c',
   'src/osmium_vector_layer.c',
   'src/osmium_tile_layer.c',
   'src/osmium_wms_layer.c',
@@ -30,6 +31,8 @@ osmium_sources = [
   'src/proj/projection.c',
   'src/raster/raster.c',
   'src/vector/vector_data.c',
+  'src/vector/vector_edit.c',
+  'src/vector/vector_topology.c',
   'src/tms/tms.c',
   'src/wms/wms.c',
 ]

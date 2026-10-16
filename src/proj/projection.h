@@ -40,6 +40,9 @@ int osmium_projection_inverse(const OsmiumProjection *projection, double nx, dou
  * set to NaN. Returns the number of positions that failed. */
 size_t osmium_projection_forward_many(const OsmiumProjection *projection, double *xy, size_t n);
 
+/* In place conversion of n interleaved normalized x/y pairs back to lon/lat degrees. */
+size_t osmium_projection_inverse_many(const OsmiumProjection *projection, double *xy, size_t n);
+
 /* Datum aware conversion between two arbitrary CRSs, picking the best PROJ operation for the area
  * (west, south, east, north in degrees; pass NULL when unknown). */
 typedef struct OsmiumTransform OsmiumTransform;

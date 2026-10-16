@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_vector_layer.h"
 
-#include "osmium_map_private.h"
+#include "osmium_vector_layer_private.h"
 #include "vector/vector_data.h"
 #include "tms/tms.h"
 #include <math.h>
@@ -41,42 +41,6 @@ typedef struct {
   double point_radius;
 } RenderJob;
 
-typedef struct {
-  GdkTexture *texture;
-  guint id;
-  guint zoom;
-  double x;
-  double y;
-  int width;
-  int height;
-} LayerImage;
-
-struct _OsmiumVectorLayer {
-  GtkWidget parent_instance;
-
-  OsmiumMap *map; /* weak */
-  gulong view_handler;
-  gulong crs_handler;
-
-  char *path;
-  char *user_agent;
-  char *source_crs;
-  GdkRGBA stroke_color;
-  GdkRGBA fill_color;
-  double line_width;
-  double point_radius;
-
-  guint generation;
-  gboolean loading;
-  OsmiumVectorData *data;
-  GArray *selection;
-  GArray *selected_indices;
-  guint render_source;
-  guint last_request_id;
-  LayerImage *image;
-  GCancellable *cancellable;
-};
-
 OSMIUM_API GType osmium_vector_layer_get_type(void);
 
 G_DEFINE_TYPE(OsmiumVectorLayer, osmium_vector_layer, GTK_TYPE_WIDGET)
@@ -98,7 +62,7 @@ enum {
 
 static GParamSpec *properties[N_PROPS];
 
-enum { SIGNAL_LOAD_FAILED, N_SIGNALS };
+enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, N_SIGNALS };
 
 static guint signals[N_SIGNALS];
 
@@ -173,6 +137,10 @@ static void on_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
 
   osmium_vector_data_free(self->data);
   self->data = loaded;
+  if (self->session != NULL) {
+    osmium_edit_session_free(self->session);
+    self->session = osmium_edit_session_new(self->data);
+  }
   rebuild_selected_indices(self);
 
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_N_FEATURES]);
@@ -310,7 +278,7 @@ static void trace_kind(cairo_t *cr,
   for (size_t i = 0; i < job->data->n_features; i++) {
     const OsmiumVectorFeature *f = &job->data->features[i];
 
-    if (f->kind != kind) {
+    if (f->kind != kind || f->deleted) {
       continue;
     }
 
@@ -626,7 +594,7 @@ static void draw_selection(OsmiumVectorLayer *self,
 static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
   OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(widget);
 
-  if (self->map == NULL || (self->image == NULL && self->selected_indices->len == 0)) {
+  if (self->map == NULL || (self->image == NULL && self->selected_indices->len == 0 && self->session == NULL)) {
     return;
   }
 
@@ -659,6 +627,7 @@ static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapsho
   }
 
   draw_selection(self, snapshot, width, height, center_x, center_y);
+  osmium_editor_draw(self, snapshot, width, height, center_x, center_y);
   gtk_snapshot_pop(snapshot);
 }
 
@@ -675,6 +644,21 @@ void osmium_feature_field_free(OsmiumFeatureField *field) {
   g_free(field);
 }
 
+void osmium_vector_layer_rebuild_selection(OsmiumVectorLayer *self) {
+  rebuild_selected_indices(self);
+}
+
+void osmium_vector_layer_emit_editing_changed(OsmiumVectorLayer *self) {
+  g_signal_emit(self, signals[SIGNAL_EDITING_CHANGED], 0);
+}
+
+void osmium_vector_layer_refresh(OsmiumVectorLayer *self) {
+  rebuild_selected_indices(self);
+  render_now(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+  osmium_vector_layer_emit_editing_changed(self);
+}
+
 static void rebuild_selected_indices(OsmiumVectorLayer *self) {
   g_array_set_size(self->selected_indices, 0);
 
@@ -684,7 +668,7 @@ static void rebuild_selected_indices(OsmiumVectorLayer *self) {
 
   for (size_t i = 0; i < self->data->n_features; i++) {
     for (guint s = 0; s < self->selection->len; s++) {
-      if (self->data->features[i].fid == g_array_index(self->selection, gint64, s)) {
+      if (!self->data->features[i].deleted && self->data->features[i].fid == g_array_index(self->selection, gint64, s)) {
         g_array_append_val(self->selected_indices, i);
         break;
       }
@@ -732,17 +716,31 @@ GPtrArray *osmium_vector_layer_get_feature_attributes(OsmiumVectorLayer *self, g
   OsmiumVectorField *fields = NULL;
   size_t n_fields = 0;
 
-  if (self->data == NULL ||
-      osmium_vector_data_get_attributes(self->data, fid, &fields, &n_fields) != OSMIUM_OK) {
+  if (self->data == NULL) {
+    return NULL;
+  }
+
+  const ptrdiff_t index = osmium_vector_data_find_fid(self->data, fid);
+
+  if (index < 0 || self->data->features[index].deleted) {
+    return NULL;
+  }
+
+  /* features created in an edit session have no row in the file yet */
+  const osmium_error err = fid < 0 ? osmium_vector_data_get_fields(self->data, &fields, &n_fields)
+                                   : osmium_vector_data_get_attributes(self->data, fid, &fields, &n_fields);
+
+  if (err != OSMIUM_OK) {
     return NULL;
   }
 
   GPtrArray *result = g_ptr_array_new_with_free_func((GDestroyNotify)osmium_feature_field_free);
   for (size_t i = 0; i < n_fields; i++) {
     OsmiumFeatureField *field = g_new0(OsmiumFeatureField, 1);
+    const char *edited = self->session != NULL ? osmium_edit_get_override(self->session, fid, fields[i].name) : NULL;
 
     field->name = g_strdup(fields[i].name);
-    field->value = g_strdup(fields[i].value);
+    field->value = g_strdup(edited != NULL ? edited : fields[i].value);
     field->type = (OsmiumFeatureFieldType)fields[i].type;
     field->width = fields[i].width;
     g_ptr_array_add(result, field);
@@ -785,6 +783,10 @@ GPtrArray *osmium_vector_layer_get_fields(OsmiumVectorLayer *self) {
 }
 
 static gboolean check_writable(OsmiumVectorLayer *self, GError **error) {
+  if (self->session != NULL) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_BUSY, "Save or discard the layer's edits first");
+    return FALSE;
+  }
   if (self->data == NULL || !osmium_vector_data_is_editable(self->data)) {
     g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_READ_ONLY,
                         "This layer is read-only (remote or not writable file)");
@@ -912,6 +914,7 @@ void osmium_vector_layer_set_map(OsmiumVectorLayer *self, OsmiumMap *map) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    osmium_editor_detach(self, self->map);
     g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
     self->crs_handler = 0;
@@ -922,6 +925,7 @@ void osmium_vector_layer_set_map(OsmiumVectorLayer *self, OsmiumMap *map) {
     g_set_weak_pointer(&self->map, map);
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
     self->crs_handler = g_signal_connect(map, "notify::crs", G_CALLBACK(on_map_crs_changed), self);
+    osmium_editor_attach(self, map);
   }
 
   g_clear_pointer(&self->image, image_free);
@@ -1143,6 +1147,8 @@ static void osmium_vector_layer_dispose(GObject *object) {
 
   g_clear_object(&self->cancellable);
   g_clear_pointer(&self->image, image_free);
+  g_clear_pointer(&self->session, osmium_edit_session_free);
+  osmium_editor_finalize(self);
   g_clear_pointer(&self->selection, g_array_unref);
   g_clear_pointer(&self->selected_indices, g_array_unref);
   g_clear_pointer(&self->data, osmium_vector_data_free);
@@ -1272,6 +1278,8 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
 
   g_object_class_install_properties(object_class, N_PROPS, properties);
 
+  signals[SIGNAL_EDITING_CHANGED] = g_signal_new("editing-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
+                                                  0, NULL, NULL, NULL, G_TYPE_NONE, 0);
   signals[SIGNAL_LOAD_FAILED] = g_signal_new("load-failed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
                                              NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_STRING);
 
@@ -1286,6 +1294,7 @@ static void osmium_vector_layer_init(OsmiumVectorLayer *self) {
   gdk_rgba_parse(&self->stroke_color, "#1c71d8");
   gdk_rgba_parse(&self->fill_color, "rgba(28, 113, 216, 0.35)");
   self->user_agent = g_strdup("Osmium/0.1");
+  osmium_editor_init(self);
   self->selection = g_array_new(FALSE, FALSE, sizeof(gint64));
   self->selected_indices = g_array_new(FALSE, FALSE, sizeof(size_t));
   self->line_width = OSMIUM_VECTOR_LAYER_DEFAULT_LINE_WIDTH;

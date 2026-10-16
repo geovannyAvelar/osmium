@@ -43,6 +43,7 @@ static __thread PJ_CONTEXT *thread_context;
 typedef struct {
   char *definition;
   PJ *forward;
+  PJ *inverse;
 } CacheEntry;
 
 static __thread CacheEntry thread_cache[TRANSFORM_CACHE_SIZE];
@@ -195,35 +196,42 @@ void osmium_projection_units_to_normalized(const OsmiumProjection *projection, d
 
 static PJ *thread_transformer(const OsmiumProjection *projection, int forward) {
   PJ_CONTEXT *context = context_for_thread();
-  const char *source = forward ? "EPSG:4326" : projection->definition;
-  const char *target = forward ? projection->definition : "EPSG:4326";
+  CacheEntry *entry = NULL;
 
-  if (forward) {
-    for (int i = 0; i < TRANSFORM_CACHE_SIZE; i++) {
-      if (thread_cache[i].definition && strcmp(thread_cache[i].definition, projection->definition) == 0) {
-        return thread_cache[i].forward;
-      }
+  for (int i = 0; i < TRANSFORM_CACHE_SIZE; i++) {
+    if (thread_cache[i].definition && strcmp(thread_cache[i].definition, projection->definition) == 0) {
+      entry = &thread_cache[i];
+      break;
     }
   }
 
-  PJ *raw = proj_create_crs_to_crs(context, source, target, NULL);
-  PJ *normalized = raw ? proj_normalize_for_visualization(context, raw) : NULL;
-
-  if (raw) {
-    proj_destroy(raw);
-  }
-
-  if (forward && normalized) {
-    CacheEntry *slot = &thread_cache[thread_cache_next++ % TRANSFORM_CACHE_SIZE];
-
-    if (slot->forward) {
-      proj_destroy(slot->forward);
+  if (!entry) {
+    entry = &thread_cache[thread_cache_next++ % TRANSFORM_CACHE_SIZE];
+    if (entry->forward) {
+      proj_destroy(entry->forward);
     }
-    free(slot->definition);
-    slot->definition = strdup(projection->definition);
-    slot->forward = normalized;
+    if (entry->inverse) {
+      proj_destroy(entry->inverse);
+    }
+    free(entry->definition);
+    entry->definition = strdup(projection->definition);
+    entry->forward = NULL;
+    entry->inverse = NULL;
   }
-  return normalized;
+
+  PJ **slot = forward ? &entry->forward : &entry->inverse;
+
+  if (!*slot) {
+    const char *source = forward ? "EPSG:4326" : projection->definition;
+    const char *target = forward ? projection->definition : "EPSG:4326";
+    PJ *raw = proj_create_crs_to_crs(context, source, target, NULL);
+
+    if (raw) {
+      *slot = proj_normalize_for_visualization(context, raw);
+      proj_destroy(raw);
+    }
+  }
+  return *slot;
 }
 
 int osmium_projection_forward(const OsmiumProjection *projection, double lon, double lat, double *nx, double *ny) {
@@ -269,8 +277,6 @@ int osmium_projection_inverse(const OsmiumProjection *projection, double nx, dou
   osmium_projection_normalized_to_units(projection, nx, ny, &x, &y);
 
   PJ_COORD out = proj_trans(transformer, PJ_FWD, proj_coord(x, y, 0.0, 0.0));
-
-  proj_destroy(transformer);
   if (!isfinite(out.xy.x) || !isfinite(out.xy.y)) {
     return 0;
   }
@@ -312,6 +318,45 @@ size_t osmium_projection_forward_many(const OsmiumProjection *projection, double
       continue;
     }
     osmium_projection_units_to_normalized(projection, xy[i * 2], xy[i * 2 + 1], &xy[i * 2], &xy[i * 2 + 1]);
+  }
+  return failed;
+}
+
+size_t osmium_projection_inverse_many(const OsmiumProjection *projection, double *xy, size_t n) {
+  size_t failed = 0;
+
+  if (projection->web_mercator) {
+    for (size_t i = 0; i < n; i++) {
+      const double nx = xy[i * 2];
+      const double ny = xy[i * 2 + 1];
+
+      xy[i * 2] = nx * 360.0 - 180.0;
+      xy[i * 2 + 1] = atan(sinh(M_PI * (1.0 - 2.0 * ny))) * 180.0 / M_PI;
+    }
+    return 0;
+  }
+
+  PJ *transformer = thread_transformer(projection, 0);
+
+  for (size_t i = 0; i < n; i++) {
+    osmium_projection_normalized_to_units(projection, xy[i * 2], xy[i * 2 + 1], &xy[i * 2], &xy[i * 2 + 1]);
+  }
+
+  if (!transformer) {
+    for (size_t i = 0; i < n * 2; i++) {
+      xy[i] = NAN;
+    }
+    return n;
+  }
+
+  proj_trans_generic(transformer, PJ_FWD, xy, 2 * sizeof(double), n, xy + 1, 2 * sizeof(double), n, NULL, 0, 0,
+                     NULL, 0, 0);
+
+  for (size_t i = 0; i < n; i++) {
+    if (!isfinite(xy[i * 2]) || !isfinite(xy[i * 2 + 1])) {
+      xy[i * 2] = xy[i * 2 + 1] = NAN;
+      failed++;
+    }
   }
   return failed;
 }
