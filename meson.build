@@ -21,6 +21,7 @@ add_project_arguments('-fvisibility=hidden', '-Wno-unused-parameter', language: 
 osmium_sources = [
   'src/osmium_compass.c',
   'src/osmium_crs.c',
+  'src/osmium_expression.c',
   'src/osmium_map.c',
   'src/osmium_raster_layer.c',
   'src/osmium_vector_editor.c',
@@ -43,6 +44,7 @@ osmium_headers = [
   'src/osmium.h',
   'src/osmium_compass.h',
   'src/osmium_crs.h',
+  'src/osmium_expression.h',
   'src/osmium_map.h',
   'src/osmium_raster_layer.h',
   'src/osmium_vector_layer.h',

@@ -208,6 +208,26 @@ OSMIUM_API char **osmium_vector_layer_dup_unique_values(OsmiumVectorLayer *self,
 /* The values of a field that parse as numbers, as a GArray of double. */
 OSMIUM_API GArray *osmium_vector_layer_dup_numeric_values(OsmiumVectorLayer *self, const char *field);
 
+/* A snapshot of the attribute table with unsaved edits applied: one row per live feature, in
+ * feature order. cells is row-major (n_rows * n_fields). */
+typedef struct {
+  guint n_fields;
+  char **names;
+  OsmiumFeatureFieldType *types;
+  guint n_rows;
+  gint64 *fids;
+  char **cells;
+} OsmiumAttributeTable;
+
+OSMIUM_API OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self);
+OSMIUM_API void osmium_attribute_table_free(OsmiumAttributeTable *table);
+
+OSMIUM_API gboolean osmium_vector_layer_get_selection_extent(OsmiumVectorLayer *self,
+                                                             double *lat_min,
+                                                             double *lon_min,
+                                                             double *lat_max,
+                                                             double *lon_max);
+
 OSMIUM_API guint osmium_vector_layer_get_n_features(OsmiumVectorLayer *self);
 
 OSMIUM_API gboolean osmium_vector_layer_get_extent(OsmiumVectorLayer *self,

@@ -903,6 +903,101 @@ osmium_error osmium_vector_data_read_column(OsmiumVectorData *vec,
   return err;
 }
 
+osmium_error osmium_vector_data_read_table(OsmiumVectorData *vec,
+                                           long long **fids,
+                                           char ***cells,
+                                           size_t *n_rows,
+                                           size_t *n_fields) {
+  if (!vec || !fids || !cells || !n_rows || !n_fields) {
+    return OSMIUM_NULL_POINTER;
+  }
+  *fids = NULL;
+  *cells = NULL;
+  *n_rows = 0;
+  *n_fields = 0;
+
+  pthread_mutex_lock(&vec->lock);
+
+  if (!vec->dataset) {
+    const char *path = vec->vsi_name ? vec->vsi_name : vec->source_path;
+
+    if (path) {
+      vec->dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
+    }
+  }
+
+  OGRLayerH layer = vec->dataset ? GDALDatasetGetLayer(vec->dataset, 0) : NULL;
+  osmium_error err = OSMIUM_FILE_ERROR;
+
+  if (layer) {
+    OGRFeatureDefnH defn = OGR_L_GetLayerDefn(layer);
+    const size_t columns = (size_t)OGR_FD_GetFieldCount(defn);
+    size_t capacity = 1024;
+    size_t count = 0;
+    long long *out_fids = malloc(capacity * sizeof(*out_fids));
+    char **out_cells = malloc(capacity * (columns ? columns : 1) * sizeof(*out_cells));
+    OGRFeatureH feature;
+
+    err = OSMIUM_OUT_OF_MEMORY;
+    if (out_fids && out_cells) {
+      OGR_L_ResetReading(layer);
+      while ((feature = OGR_L_GetNextFeature(layer)) != NULL) {
+        if (count == capacity) {
+          long long *grown_fids = realloc(out_fids, capacity * 2 * sizeof(*out_fids));
+          char **grown_cells = realloc(out_cells, capacity * 2 * (columns ? columns : 1) * sizeof(*out_cells));
+
+          if (grown_fids) {
+            out_fids = grown_fids;
+          }
+          if (grown_cells) {
+            out_cells = grown_cells;
+          }
+          if (!grown_fids || !grown_cells) {
+            OGR_F_Destroy(feature);
+            break;
+          }
+          capacity *= 2;
+        }
+
+        out_fids[count] = OGR_F_GetFID(feature);
+        for (size_t i = 0; i < columns; i++) {
+          OGRFieldDefnH field_defn = OGR_FD_GetFieldDefn(defn, (int)i);
+          char *value;
+
+          if (!OGR_F_IsFieldSetAndNotNull(feature, (int)i)) {
+            value = strdup("");
+          } else if (OGR_Fld_GetType(field_defn) == OFTReal) {
+            char text[64];
+
+            CPLsnprintf(text, sizeof(text), "%.15g", OGR_F_GetFieldAsDouble(feature, (int)i));
+            value = strdup(text);
+          } else {
+            const char *text = OGR_F_GetFieldAsString(feature, (int)i);
+
+            value = strdup(text ? text : "");
+          }
+          out_cells[count * columns + i] = value;
+        }
+        count++;
+        OGR_F_Destroy(feature);
+      }
+      OGR_L_ResetReading(layer);
+
+      *fids = out_fids;
+      *cells = out_cells;
+      *n_rows = count;
+      *n_fields = columns;
+      err = OSMIUM_OK;
+    } else {
+      free(out_fids);
+      free(out_cells);
+    }
+  }
+
+  pthread_mutex_unlock(&vec->lock);
+  return err;
+}
+
 static void set_message(char *message, size_t size, const char *format, const char *a, const char *b) {
   if (message && size > 0) {
     snprintf(message, size, format, a ? a : "", b ? b : "");

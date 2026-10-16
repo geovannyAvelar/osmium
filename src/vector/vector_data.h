@@ -138,6 +138,14 @@ osmium_error osmium_vector_data_read_column(OsmiumVectorData *vec,
                                             char ***values,
                                             size_t *n);
 
+/* Every attribute of every row of the file: fids[n_rows] and cells[n_rows * n_fields] (row-major,
+ * field order of osmium_vector_data_get_fields). Free every cell and both arrays. */
+osmium_error osmium_vector_data_read_table(OsmiumVectorData *vec,
+                                           long long **fids,
+                                           char ***cells,
+                                           size_t *n_rows,
+                                           size_t *n_fields);
+
 void osmium_vector_fields_free(OsmiumVectorField *fields, size_t n_fields);
 
 int osmium_vector_data_is_editable(const OsmiumVectorData *vec);

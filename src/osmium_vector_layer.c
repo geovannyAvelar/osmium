@@ -66,7 +66,7 @@ enum {
 
 static GParamSpec *properties[N_PROPS];
 
-enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, N_SIGNALS };
+enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, SIGNAL_SELECTION_CHANGED, N_SIGNALS };
 
 static guint signals[N_SIGNALS];
 
@@ -1291,6 +1291,7 @@ void osmium_vector_layer_set_selection(OsmiumVectorLayer *self, const gint64 *fi
 
   rebuild_selected_indices(self);
   gtk_widget_queue_draw(GTK_WIDGET(self));
+  g_signal_emit(self, signals[SIGNAL_SELECTION_CHANGED], 0);
 }
 
 GArray *osmium_vector_layer_get_selection(OsmiumVectorLayer *self) {
@@ -1601,6 +1602,134 @@ GArray *osmium_vector_layer_dup_numeric_values(OsmiumVectorLayer *self, const ch
   return values;
 }
 
+void osmium_attribute_table_free(OsmiumAttributeTable *table) {
+  if (table == NULL) {
+    return;
+  }
+  g_strfreev(table->names);
+  g_free(table->types);
+  g_free(table->fids);
+  for (gsize i = 0; i < (gsize)table->n_rows * table->n_fields; i++) {
+    g_free(table->cells[i]);
+  }
+  g_free(table->cells);
+  g_free(table);
+}
+
+OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  if (self->data == NULL) {
+    return NULL;
+  }
+
+  g_autoptr(GPtrArray) fields = osmium_vector_layer_get_fields(self);
+  long long *file_fids = NULL;
+  char **file_cells = NULL;
+  size_t file_rows = 0, file_columns = 0;
+
+  if (fields == NULL) {
+    return NULL;
+  }
+  if (osmium_vector_data_read_table(self->data, &file_fids, &file_cells, &file_rows, &file_columns) != OSMIUM_OK) {
+    file_fids = NULL;
+    file_cells = NULL;
+    file_rows = file_columns = 0;
+  }
+
+  OsmiumAttributeTable *table = g_new0(OsmiumAttributeTable, 1);
+  GHashTable *by_fid = g_hash_table_new(g_int64_hash, g_int64_equal);
+  guint live = 0;
+
+  table->n_fields = fields->len;
+  table->names = g_new0(char *, fields->len + 1);
+  table->types = g_new0(OsmiumFeatureFieldType, MAX(fields->len, 1));
+  for (guint i = 0; i < fields->len; i++) {
+    const OsmiumFeatureField *field = g_ptr_array_index(fields, i);
+
+    table->names[i] = g_strdup(field->name);
+    table->types[i] = field->type;
+  }
+
+  for (size_t r = 0; r < file_rows; r++) {
+    g_hash_table_insert(by_fid, &file_fids[r], GSIZE_TO_POINTER(r + 1));
+  }
+
+  for (size_t i = 0; i < self->data->n_features; i++) {
+    live += self->data->features[i].deleted ? 0 : 1;
+  }
+
+  table->n_rows = live;
+  table->fids = g_new(gint64, MAX(live, 1));
+  table->cells = g_new0(char *, MAX((gsize)live * table->n_fields, 1));
+
+  guint row = 0;
+
+  for (size_t i = 0; i < self->data->n_features; i++) {
+    const OsmiumVectorFeature *f = &self->data->features[i];
+    const gsize source = GPOINTER_TO_SIZE(g_hash_table_lookup(by_fid, &f->fid));
+
+    if (f->deleted) {
+      continue;
+    }
+    table->fids[row] = f->fid;
+    for (guint c = 0; c < table->n_fields; c++) {
+      const char *edited = self->session != NULL ? osmium_edit_get_override(self->session, f->fid, table->names[c]) : NULL;
+      const char *value = edited;
+
+      if (value == NULL && source != 0 && c < file_columns) {
+        value = file_cells[(source - 1) * file_columns + c];
+      }
+      table->cells[(gsize)row * table->n_fields + c] = g_strdup(value != NULL ? value : "");
+    }
+    row++;
+  }
+
+  g_hash_table_destroy(by_fid);
+  for (size_t i = 0; i < file_rows * file_columns; i++) {
+    free(file_cells[i]);
+  }
+  free(file_cells);
+  free(file_fids);
+  return table;
+}
+
+gboolean osmium_vector_layer_get_selection_extent(OsmiumVectorLayer *self,
+                                                  double *lat_min,
+                                                  double *lon_min,
+                                                  double *lat_max,
+                                                  double *lon_max) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  gboolean found = FALSE;
+  double min_lat = 90, max_lat = -90, min_lon = 180, max_lon = -180;
+
+  for (guint s = 0; self->data != NULL && s < self->selected_indices->len; s++) {
+    const OsmiumVectorFeature *f = &self->data->features[g_array_index(self->selected_indices, size_t, s)];
+
+    if (f->deleted) {
+      continue;
+    }
+    const size_t n = f->part_start[f->n_parts];
+
+    for (size_t v = 0; v < n; v++) {
+      min_lon = MIN(min_lon, f->ll[v * 2]);
+      max_lon = MAX(max_lon, f->ll[v * 2]);
+      min_lat = MIN(min_lat, f->ll[v * 2 + 1]);
+      max_lat = MAX(max_lat, f->ll[v * 2 + 1]);
+      found = TRUE;
+    }
+  }
+
+  if (found) {
+    *lat_min = min_lat;
+    *lat_max = max_lat;
+    *lon_min = min_lon;
+    *lon_max = max_lon;
+  }
+  return found;
+}
+
 guint osmium_vector_layer_get_n_features(OsmiumVectorLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), 0);
 
@@ -1783,6 +1912,8 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
 
   signals[SIGNAL_EDITING_CHANGED] = g_signal_new("editing-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
                                                   0, NULL, NULL, NULL, G_TYPE_NONE, 0);
+  signals[SIGNAL_SELECTION_CHANGED] = g_signal_new("selection-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
+                                                   NULL, NULL, NULL, G_TYPE_NONE, 0);
   signals[SIGNAL_LOAD_FAILED] = g_signal_new("load-failed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
                                              NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_STRING);
 

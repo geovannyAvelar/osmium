@@ -3,6 +3,7 @@
 
 #include "osmium_compass.h"
 #include "osmium_crs.h"
+#include "osmium_expression.h"
 #include "osmium_map.h"
 #include "osmium_vector_layer.h"
 #include "osmium_vector_style.h"
