@@ -3,6 +3,7 @@
 
 #include "osmium_map_private.h"
 #include "osmium_vector_layer.h"
+#include "osmium_vector_style.h"
 #include "vector/vector_edit.h"
 
 typedef struct {
@@ -60,10 +61,9 @@ struct _OsmiumVectorLayer {
   char *path;
   char *user_agent;
   char *source_crs;
-  GdkRGBA stroke_color;
-  GdkRGBA fill_color;
-  double line_width;
-  double point_radius;
+  OsmiumStyle *style;
+  GHashTable *columns;
+  PangoLayout *label_layout;
 
   guint generation;
   gboolean loading;

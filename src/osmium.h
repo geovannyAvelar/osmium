@@ -5,6 +5,7 @@
 #include "osmium_crs.h"
 #include "osmium_map.h"
 #include "osmium_vector_layer.h"
+#include "osmium_vector_style.h"
 #include "osmium_raster_layer.h"
 #include "osmium_tile_layer.h"
 #include "osmium_wms_layer.h"

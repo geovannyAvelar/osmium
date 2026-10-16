@@ -130,6 +130,14 @@ osmium_error osmium_vector_data_get_attributes(OsmiumVectorData *vec,
                                                OsmiumVectorField **fields,
                                                size_t *n_fields);
 
+/* One value per row of the file for the named field, in file order, as strings. fids and values are
+ * malloc'd arrays of n entries (free values[i] and both arrays). */
+osmium_error osmium_vector_data_read_column(OsmiumVectorData *vec,
+                                            const char *field,
+                                            long long **fids,
+                                            char ***values,
+                                            size_t *n);
+
 void osmium_vector_fields_free(OsmiumVectorField *fields, size_t n_fields);
 
 int osmium_vector_data_is_editable(const OsmiumVectorData *vec);

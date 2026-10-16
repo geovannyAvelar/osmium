@@ -35,11 +35,15 @@ typedef struct {
   double y;
   int width;
   int height;
-  GdkRGBA stroke_color;
-  GdkRGBA fill_color;
-  double line_width;
-  double point_radius;
+  OsmiumSymbol *symbols;
+  guint n_symbols;
+  guint16 *index;
+  size_t n_index;
+  GArray **buckets;
+  double reach;
 } RenderJob;
+
+#define NO_SYMBOL 0xFFFF
 
 OSMIUM_API GType osmium_vector_layer_get_type(void);
 
@@ -67,6 +71,7 @@ enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, N_SIGNALS };
 static guint signals[N_SIGNALS];
 
 static void render_now(OsmiumVectorLayer *self);
+static void invalidate_columns(OsmiumVectorLayer *self);
 static void rebuild_selected_indices(OsmiumVectorLayer *self);
 static void image_free(gpointer data);
 
@@ -137,6 +142,7 @@ static void on_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
 
   osmium_vector_data_free(self->data);
   self->data = loaded;
+  invalidate_columns(self);
   if (self->session != NULL) {
     osmium_edit_session_free(self->session);
     self->session = osmium_edit_session_new(self->data);
@@ -199,6 +205,12 @@ static void render_job_free(gpointer data) {
 
   osmium_vector_data_free(job->data);
   g_clear_pointer(&job->projection, osmium_projection_unref);
+  for (guint i = 0; job->buckets != NULL && i < job->n_symbols; i++) {
+    g_clear_pointer(&job->buckets[i], g_array_unref);
+  }
+  g_free(job->buckets);
+  g_free(job->symbols);
+  g_free(job->index);
   g_free(job);
 }
 
@@ -212,21 +224,52 @@ static void image_free(gpointer data) {
   g_free(image);
 }
 
+static void trace_marker(cairo_t *cr, OsmiumPointShape shape, double x, double y, double r) {
+  switch (shape) {
+  case OSMIUM_POINT_SQUARE:
+    cairo_rectangle(cr, x - r, y - r, 2 * r, 2 * r);
+    break;
+  case OSMIUM_POINT_DIAMOND:
+    cairo_move_to(cr, x, y - r * 1.3);
+    cairo_line_to(cr, x + r * 1.3, y);
+    cairo_line_to(cr, x, y + r * 1.3);
+    cairo_line_to(cr, x - r * 1.3, y);
+    cairo_close_path(cr);
+    break;
+  case OSMIUM_POINT_TRIANGLE:
+    cairo_move_to(cr, x, y - r * 1.2);
+    cairo_line_to(cr, x + r * 1.1, y + r * 0.9);
+    cairo_line_to(cr, x - r * 1.1, y + r * 0.9);
+    cairo_close_path(cr);
+    break;
+  case OSMIUM_POINT_CROSS:
+    cairo_move_to(cr, x - r, y);
+    cairo_line_to(cr, x + r, y);
+    cairo_move_to(cr, x, y - r);
+    cairo_line_to(cr, x, y + r);
+    break;
+  case OSMIUM_POINT_CIRCLE:
+  default:
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x, y, r, 0.0, 2.0 * G_PI);
+    break;
+  }
+}
+
 static void trace_feature(cairo_t *cr,
                           const OsmiumVectorFeature *f,
                           double scale,
                           double origin_x,
                           double origin_y,
-                          double point_radius) {
+                          const OsmiumSymbol *symbol) {
   for (size_t p = 0; p < f->n_parts; p++) {
     const size_t start = f->part_start[p];
     const size_t end = f->part_start[p + 1];
     size_t last = end;
 
     if (f->kind == OSMIUM_VECTOR_POINT) {
-      cairo_new_sub_path(cr);
-      cairo_arc(cr, f->xy[start * 2] * scale - origin_x, f->xy[start * 2 + 1] * scale - origin_y,
-                point_radius, 0.0, 2.0 * G_PI);
+      trace_marker(cr, symbol->shape, f->xy[start * 2] * scale - origin_x, f->xy[start * 2 + 1] * scale - origin_y,
+                   symbol->point_radius);
       continue;
     }
 
@@ -266,17 +309,21 @@ static void trace_feature(cairo_t *cr,
   }
 }
 
-static void trace_kind(cairo_t *cr,
-                       const RenderJob *job,
-                       OsmiumVectorKind kind,
-                       double scale,
-                       double origin_x,
-                       double origin_y,
-                       int height) {
-  const double reach = job->line_width + job->point_radius;
+static gboolean trace_bucket(cairo_t *cr,
+                             const RenderJob *job,
+                             guint symbol,
+                             OsmiumVectorKind kind,
+                             double scale,
+                             double origin_x,
+                             double origin_y,
+                             int height) {
+  const GArray *bucket = job->buckets[symbol];
+  const OsmiumSymbol *style = &job->symbols[symbol];
+  const double reach = job->reach;
+  gboolean traced = FALSE;
 
-  for (size_t i = 0; i < job->data->n_features; i++) {
-    const OsmiumVectorFeature *f = &job->data->features[i];
+  for (guint k = 0; k < bucket->len; k++) {
+    const OsmiumVectorFeature *f = &job->data->features[g_array_index(bucket, size_t, k)];
 
     if (f->kind != kind || f->deleted) {
       continue;
@@ -296,12 +343,47 @@ static void trace_kind(cairo_t *cr,
       continue;
     }
 
-    trace_feature(cr, f, scale, origin_x, origin_y, job->point_radius);
+    trace_feature(cr, f, scale, origin_x, origin_y, style);
+    traced = TRUE;
   }
+  return traced;
 }
 
 static void set_source(cairo_t *cr, const GdkRGBA *color) {
   cairo_set_source_rgba(cr, color->red, color->green, color->blue, color->alpha);
+}
+
+static void set_line(cairo_t *cr, const OsmiumSymbol *symbol) {
+  const double w = MAX(symbol->line_width, 1.0);
+  double pattern[4];
+  int n = 0;
+
+  switch (symbol->line_style) {
+  case OSMIUM_LINE_DASH:
+    pattern[0] = 5 * w;
+    pattern[1] = 3 * w;
+    n = 2;
+    break;
+  case OSMIUM_LINE_DOT:
+    pattern[0] = w;
+    pattern[1] = 2 * w;
+    n = 2;
+    break;
+  case OSMIUM_LINE_DASH_DOT:
+    pattern[0] = 5 * w;
+    pattern[1] = 2 * w;
+    pattern[2] = w;
+    pattern[3] = 2 * w;
+    n = 4;
+    break;
+  case OSMIUM_LINE_SOLID:
+  default:
+    break;
+  }
+
+  cairo_set_line_width(cr, symbol->line_width);
+  cairo_set_dash(cr, pattern, n, 0.0);
+  cairo_set_line_cap(cr, n > 0 ? CAIRO_LINE_CAP_BUTT : CAIRO_LINE_CAP_ROUND);
 }
 
 typedef struct {
@@ -323,24 +405,49 @@ static gpointer render_band(gpointer data) {
       band->rows, band->stride);
   cairo_t *cr = cairo_create(surface);
 
-  cairo_set_line_width(cr, job->line_width);
   cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
 
-  trace_kind(cr, job, OSMIUM_VECTOR_POLYGON, scale, job->x, origin_y, band->rows);
-  cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
-  set_source(cr, &job->fill_color);
-  cairo_fill_preserve(cr);
-  set_source(cr, &job->stroke_color);
-  cairo_stroke(cr);
+  for (guint s = 0; s < job->n_symbols; s++) {
+    const OsmiumSymbol *symbol = &job->symbols[s];
 
-  trace_kind(cr, job, OSMIUM_VECTOR_LINE, scale, job->x, origin_y, band->rows);
-  set_source(cr, &job->stroke_color);
-  cairo_stroke(cr);
+    if (trace_bucket(cr, job, s, OSMIUM_VECTOR_POLYGON, scale, job->x, origin_y, band->rows)) {
+      cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+      set_source(cr, &symbol->fill);
+      cairo_fill_preserve(cr);
+      set_line(cr, symbol);
+      set_source(cr, &symbol->stroke);
+      cairo_stroke(cr);
+    }
+  }
 
-  trace_kind(cr, job, OSMIUM_VECTOR_POINT, scale, job->x, origin_y, band->rows);
-  cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
-  cairo_fill(cr);
+  for (guint s = 0; s < job->n_symbols; s++) {
+    const OsmiumSymbol *symbol = &job->symbols[s];
+
+    if (trace_bucket(cr, job, s, OSMIUM_VECTOR_LINE, scale, job->x, origin_y, band->rows)) {
+      set_line(cr, symbol);
+      set_source(cr, &symbol->stroke);
+      cairo_stroke(cr);
+    }
+  }
+
+  for (guint s = 0; s < job->n_symbols; s++) {
+    const OsmiumSymbol *symbol = &job->symbols[s];
+
+    if (trace_bucket(cr, job, s, OSMIUM_VECTOR_POINT, scale, job->x, origin_y, band->rows)) {
+      cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
+      if (symbol->shape == OSMIUM_POINT_CROSS) {
+        set_line(cr, symbol);
+        set_source(cr, &symbol->stroke);
+        cairo_stroke(cr);
+      } else {
+        set_source(cr, &symbol->fill);
+        cairo_fill_preserve(cr);
+        set_line(cr, symbol);
+        set_source(cr, &symbol->stroke);
+        cairo_stroke(cr);
+      }
+    }
+  }
 
   cairo_destroy(cr);
   cairo_surface_finish(surface);
@@ -359,6 +466,18 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
   if (!osmium_vector_data_begin_read(job->data, job->projection)) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "could not project the features");
     return;
+  }
+
+  job->buckets = g_new0(GArray *, job->n_symbols);
+  for (guint s = 0; s < job->n_symbols; s++) {
+    job->buckets[s] = g_array_new(FALSE, FALSE, sizeof(size_t));
+  }
+  for (size_t i = 0; i < job->data->n_features; i++) {
+    const guint symbol = i < job->n_index && job->index != NULL ? job->index[i] : (job->index == NULL ? 0 : NO_SYMBOL);
+
+    if (symbol < job->n_symbols) {
+      g_array_append_val(job->buckets[symbol], i);
+    }
   }
 
   const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, job->width);
@@ -404,6 +523,142 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
       bytes, (gsize)stride);
 
   g_task_return_pointer(task, texture, g_object_unref);
+}
+
+static void invalidate_columns(OsmiumVectorLayer *self) {
+  if (self->columns != NULL) {
+    g_hash_table_remove_all(self->columns);
+  }
+}
+
+static void free_value(gpointer data) {
+  g_free(data);
+}
+
+/* One string per feature (in memory order) for the field, with unsaved edits applied. */
+static GPtrArray *column_for(OsmiumVectorLayer *self, const char *field) {
+  GPtrArray *column;
+
+  if (self->data == NULL || field == NULL || field[0] == '\0') {
+    return NULL;
+  }
+
+  column = g_hash_table_lookup(self->columns, field);
+  if (column != NULL && column->len == self->data->n_features) {
+    return column;
+  }
+
+  long long *fids = NULL;
+  char **values = NULL;
+  size_t n = 0;
+
+  if (osmium_vector_data_read_column(self->data, field, &fids, &values, &n) != OSMIUM_OK) {
+    return NULL;
+  }
+
+  GHashTable *by_fid = g_hash_table_new(g_int64_hash, g_int64_equal);
+
+  for (size_t i = 0; i < n; i++) {
+    g_hash_table_insert(by_fid, &fids[i], values[i]);
+  }
+
+  column = g_ptr_array_new_with_free_func(free_value);
+  for (size_t i = 0; i < self->data->n_features; i++) {
+    const long long fid = self->data->features[i].fid;
+    const char *edited = self->session != NULL ? osmium_edit_get_override(self->session, fid, field) : NULL;
+    const char *value = edited != NULL ? edited : g_hash_table_lookup(by_fid, &fid);
+
+    g_ptr_array_add(column, g_strdup(value != NULL ? value : ""));
+  }
+
+  g_hash_table_destroy(by_fid);
+  for (size_t i = 0; i < n; i++) {
+    free(values[i]);
+  }
+  free(values);
+  free(fids);
+
+  g_hash_table_insert(self->columns, g_strdup(field), column);
+  return column;
+}
+
+static gboolean parse_number(const char *text, double *value) {
+  char *end = NULL;
+
+  if (text == NULL || text[0] == '\0') {
+    return FALSE;
+  }
+  *value = g_ascii_strtod(text, &end);
+  return end != text && *end == '\0' && isfinite(*value);
+}
+
+static void assign_symbols(OsmiumVectorLayer *self, RenderJob *job) {
+  const OsmiumStyle *style = self->style;
+  GPtrArray *column = style->kind == OSMIUM_STYLE_SINGLE ? NULL : column_for(self, style->field);
+
+  if (column == NULL) {
+    job->n_symbols = 1;
+    job->symbols = g_new(OsmiumSymbol, 1);
+    job->symbols[0] = style->symbol;
+    job->index = NULL;
+  } else if (style->kind == OSMIUM_STYLE_CATEGORIZED) {
+    GHashTable *lookup = g_hash_table_new(g_str_hash, g_str_equal);
+    guint other = NO_SYMBOL;
+
+    job->n_symbols = style->categories->len;
+    job->symbols = g_new(OsmiumSymbol, MAX(job->n_symbols, 1));
+    for (guint i = 0; i < style->categories->len; i++) {
+      const OsmiumStyleCategory *c = &g_array_index(style->categories, OsmiumStyleCategory, i);
+
+      job->symbols[i] = c->symbol;
+      if (c->value == NULL) {
+        other = c->visible ? i : NO_SYMBOL;
+      } else if (c->visible) {
+        g_hash_table_insert(lookup, c->value, GUINT_TO_POINTER(i + 1));
+      } else {
+        g_hash_table_insert(lookup, c->value, GUINT_TO_POINTER(NO_SYMBOL + 1));
+      }
+    }
+
+    job->n_index = column->len;
+    job->index = g_new(guint16, MAX(column->len, 1));
+    for (guint i = 0; i < column->len; i++) {
+      const guint hit = GPOINTER_TO_UINT(g_hash_table_lookup(lookup, g_ptr_array_index(column, i)));
+
+      job->index[i] = hit == 0 ? other : (guint16)(hit - 1);
+    }
+    g_hash_table_destroy(lookup);
+  } else {
+    job->n_symbols = style->classes->len;
+    job->symbols = g_new(OsmiumSymbol, MAX(job->n_symbols, 1));
+    for (guint i = 0; i < style->classes->len; i++) {
+      job->symbols[i] = g_array_index(style->classes, OsmiumStyleClass, i).symbol;
+    }
+
+    job->n_index = column->len;
+    job->index = g_new(guint16, MAX(column->len, 1));
+    for (guint i = 0; i < column->len; i++) {
+      double value;
+      guint16 symbol = NO_SYMBOL;
+
+      if (parse_number(g_ptr_array_index(column, i), &value)) {
+        for (guint c = 0; c < style->classes->len; c++) {
+          const OsmiumStyleClass *cls = &g_array_index(style->classes, OsmiumStyleClass, c);
+
+          if (value >= cls->lower && (value < cls->upper || (c == style->classes->len - 1 && value <= cls->upper))) {
+            symbol = cls->visible ? (guint16)c : NO_SYMBOL;
+            break;
+          }
+        }
+      }
+      job->index[i] = symbol;
+    }
+  }
+
+  job->reach = 0.0;
+  for (guint i = 0; i < job->n_symbols; i++) {
+    job->reach = MAX(job->reach, job->symbols[i].line_width + job->symbols[i].point_radius * 1.3);
+  }
 }
 
 static void on_rendered(GObject *source, GAsyncResult *result, gpointer user_data) {
@@ -469,10 +724,7 @@ static void render_now(OsmiumVectorLayer *self) {
   job->height = CLAMP((int)ceil(view_height * OSMIUM_VECTOR_LAYER_MARGIN), 1, OSMIUM_VECTOR_LAYER_MAX_SIZE);
   job->x = floor(center_x - job->width / 2.0);
   job->y = floor(center_y - job->height / 2.0);
-  job->stroke_color = self->stroke_color;
-  job->fill_color = self->fill_color;
-  job->line_width = self->line_width;
-  job->point_radius = self->point_radius;
+  assign_symbols(self, job);
 
   GTask *task = g_task_new(self, self->cancellable, on_rendered, NULL);
   g_task_set_task_data(task, job, render_job_free);
@@ -556,13 +808,13 @@ static void draw_selection(OsmiumVectorLayer *self,
                              : f->kind == OSMIUM_VECTOR_LINE  ? lines
                                                               : points;
 
-    append_selected_feature(target, f, scale, center_x, center_y, self->point_radius + 2.0);
+    append_selected_feature(target, f, scale, center_x, center_y, self->style->symbol.point_radius + 2.0);
   }
 
   GskPath *area_path = gsk_path_builder_free_to_path(areas);
   GskPath *line_path = gsk_path_builder_free_to_path(lines);
   GskPath *point_path = gsk_path_builder_free_to_path(points);
-  GskStroke *stroke = gsk_stroke_new(MAX((float)self->line_width + 1.5f, 3.0f));
+  GskStroke *stroke = gsk_stroke_new(MAX((float)self->style->symbol.line_width + 1.5f, 3.0f));
 
   gsk_stroke_set_line_join(stroke, GSK_LINE_JOIN_ROUND);
   gsk_stroke_set_line_cap(stroke, GSK_LINE_CAP_ROUND);
@@ -588,6 +840,153 @@ static void draw_selection(OsmiumVectorLayer *self,
   gsk_path_unref(area_path);
   gsk_path_unref(line_path);
   gsk_path_unref(point_path);
+  osmium_vector_data_end_read(self->data);
+}
+
+typedef struct {
+  float x;
+  float y;
+  float w;
+  float h;
+} LabelBox;
+
+static gboolean label_anchor(const OsmiumVectorFeature *f, double *x, double *y) {
+  if (f->n_parts == 0) {
+    return FALSE;
+  }
+
+  if (f->kind == OSMIUM_VECTOR_POINT) {
+    *x = f->xy[f->part_start[0] * 2];
+    *y = f->xy[f->part_start[0] * 2 + 1];
+    return TRUE;
+  }
+
+  if (f->kind == OSMIUM_VECTOR_LINE) {
+    size_t best = 0;
+    size_t best_len = 0;
+
+    for (size_t p = 0; p < f->n_parts; p++) {
+      if (f->part_start[p + 1] - f->part_start[p] > best_len) {
+        best_len = f->part_start[p + 1] - f->part_start[p];
+        best = p;
+      }
+    }
+    if (best_len == 0) {
+      return FALSE;
+    }
+    const size_t mid = f->part_start[best] + best_len / 2;
+
+    *x = f->xy[mid * 2];
+    *y = f->xy[mid * 2 + 1];
+    return TRUE;
+  }
+
+  *x = (f->min_x + f->max_x) / 2.0;
+  *y = (f->min_y + f->max_y) / 2.0;
+  return TRUE;
+}
+
+static void draw_labels(OsmiumVectorLayer *self,
+                        GtkSnapshot *snapshot,
+                        float width,
+                        float height,
+                        double center_x,
+                        double center_y) {
+  const OsmiumStyleLabels *labels = &self->style->labels;
+  GPtrArray *column;
+
+  if (!labels->enabled || self->data == NULL) {
+    return;
+  }
+
+  column = column_for(self, labels->field);
+  if (column == NULL || !osmium_vector_data_try_begin_read(self->data, osmium_map_get_projection(self->map))) {
+    return;
+  }
+
+  if (self->label_layout == NULL) {
+    self->label_layout = gtk_widget_create_pango_layout(GTK_WIDGET(self), NULL);
+  }
+
+  PangoFontDescription *font = pango_font_description_new();
+
+  if (labels->font_family != NULL && labels->font_family[0] != '\0') {
+    pango_font_description_set_family(font, labels->font_family);
+  }
+  pango_font_description_set_absolute_size(font, labels->size * PANGO_SCALE);
+  pango_layout_set_font_description(self->label_layout, font);
+  pango_font_description_free(font);
+
+  const double scale = 256.0 * ldexp(1.0, (int)osmium_map_get_zoom(self->map));
+  const double rad = osmium_map_get_bearing(self->map) * G_PI / 180.0;
+  const double c = cos(rad);
+  const double s = sin(rad);
+  GArray *placed = g_array_new(FALSE, FALSE, sizeof(LabelBox));
+  guint scanned = 0;
+
+  const OsmiumVectorFeature *features = self->data->features;
+
+  for (size_t i = 0; i < self->data->n_features && placed->len < 400 && scanned < 6000 && i < column->len; i++) {
+    const OsmiumVectorFeature *f = &features[i];
+    const char *text = g_ptr_array_index(column, i);
+    double ax, ay;
+
+    if (f->deleted || text[0] == '\0' || !label_anchor(f, &ax, &ay)) {
+      continue;
+    }
+
+    const double dx = ax * scale - center_x;
+    const double dy = ay * scale - center_y;
+    const float sx = (float)(width / 2.0 + dx * c + dy * s);
+    const float sy = (float)(height / 2.0 - dx * s + dy * c);
+
+    if (sx < -20 || sx > width + 20 || sy < -20 || sy > height + 20) {
+      continue;
+    }
+    scanned++;
+
+    int tw, th;
+
+    pango_layout_set_text(self->label_layout, text, -1);
+    pango_layout_get_pixel_size(self->label_layout, &tw, &th);
+
+    LabelBox box = {
+        .x = sx - tw / 2.0f + (f->kind == OSMIUM_VECTOR_POINT ? 0.0f : 0.0f),
+        .y = sy - th / 2.0f - (f->kind == OSMIUM_VECTOR_POINT ? self->style->symbol.point_radius + th / 2.0f : 0.0f),
+        .w = (float)tw,
+        .h = (float)th,
+    };
+    gboolean clash = FALSE;
+
+    for (guint k = 0; k < placed->len && !clash; k++) {
+      const LabelBox *o = &g_array_index(placed, LabelBox, k);
+
+      clash = box.x < o->x + o->w + 2 && box.x + box.w + 2 > o->x && box.y < o->y + o->h && box.y + box.h > o->y;
+    }
+    if (clash) {
+      continue;
+    }
+    g_array_append_val(placed, box);
+
+    if (labels->halo_width > 0.0 && labels->halo_color.alpha > 0.0) {
+      const float r = (float)labels->halo_width;
+      static const float offsets[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-0.7f, -0.7f}, {0.7f, -0.7f}, {-0.7f, 0.7f}, {0.7f, 0.7f}};
+
+      for (guint k = 0; k < 8; k++) {
+        gtk_snapshot_save(snapshot);
+        gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(box.x + offsets[k][0] * r, box.y + offsets[k][1] * r));
+        gtk_snapshot_append_layout(snapshot, self->label_layout, &labels->halo_color);
+        gtk_snapshot_restore(snapshot);
+      }
+    }
+
+    gtk_snapshot_save(snapshot);
+    gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(box.x, box.y));
+    gtk_snapshot_append_layout(snapshot, self->label_layout, &labels->color);
+    gtk_snapshot_restore(snapshot);
+  }
+
+  g_array_unref(placed);
   osmium_vector_data_end_read(self->data);
 }
 
@@ -627,6 +1026,7 @@ static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapsho
   }
 
   draw_selection(self, snapshot, width, height, center_x, center_y);
+  draw_labels(self, snapshot, width, height, center_x, center_y);
   osmium_editor_draw(self, snapshot, width, height, center_x, center_y);
   gtk_snapshot_pop(snapshot);
 }
@@ -653,6 +1053,7 @@ void osmium_vector_layer_emit_editing_changed(OsmiumVectorLayer *self) {
 }
 
 void osmium_vector_layer_refresh(OsmiumVectorLayer *self) {
+  invalidate_columns(self);
   rebuild_selected_indices(self);
   render_now(self);
   gtk_widget_queue_draw(GTK_WIDGET(self));
@@ -1030,18 +1431,18 @@ gboolean osmium_vector_layer_get_loading(OsmiumVectorLayer *self) {
 const GdkRGBA *osmium_vector_layer_get_stroke_color(OsmiumVectorLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
 
-  return &self->stroke_color;
+  return &self->style->symbol.stroke;
 }
 
 void osmium_vector_layer_set_stroke_color(OsmiumVectorLayer *self, const GdkRGBA *color) {
   g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
   g_return_if_fail(color != NULL);
 
-  if (gdk_rgba_equal(&self->stroke_color, color)) {
+  if (gdk_rgba_equal(&self->style->symbol.stroke, color)) {
     return;
   }
 
-  self->stroke_color = *color;
+  self->style->symbol.stroke = *color;
   render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_STROKE_COLOR]);
 }
@@ -1049,18 +1450,18 @@ void osmium_vector_layer_set_stroke_color(OsmiumVectorLayer *self, const GdkRGBA
 const GdkRGBA *osmium_vector_layer_get_fill_color(OsmiumVectorLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
 
-  return &self->fill_color;
+  return &self->style->symbol.fill;
 }
 
 void osmium_vector_layer_set_fill_color(OsmiumVectorLayer *self, const GdkRGBA *color) {
   g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
   g_return_if_fail(color != NULL);
 
-  if (gdk_rgba_equal(&self->fill_color, color)) {
+  if (gdk_rgba_equal(&self->style->symbol.fill, color)) {
     return;
   }
 
-  self->fill_color = *color;
+  self->style->symbol.fill = *color;
   render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_FILL_COLOR]);
 }
@@ -1068,17 +1469,17 @@ void osmium_vector_layer_set_fill_color(OsmiumVectorLayer *self, const GdkRGBA *
 double osmium_vector_layer_get_line_width(OsmiumVectorLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), 0.0);
 
-  return self->line_width;
+  return self->style->symbol.line_width;
 }
 
 void osmium_vector_layer_set_line_width(OsmiumVectorLayer *self, double width) {
   g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
 
-  if (self->line_width == width) {
+  if (self->style->symbol.line_width == width) {
     return;
   }
 
-  self->line_width = width;
+  self->style->symbol.line_width = width;
   render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LINE_WIDTH]);
 }
@@ -1086,19 +1487,118 @@ void osmium_vector_layer_set_line_width(OsmiumVectorLayer *self, double width) {
 double osmium_vector_layer_get_point_radius(OsmiumVectorLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), 0.0);
 
-  return self->point_radius;
+  return self->style->symbol.point_radius;
 }
 
 void osmium_vector_layer_set_point_radius(OsmiumVectorLayer *self, double radius) {
   g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
 
-  if (self->point_radius == radius) {
+  if (self->style->symbol.point_radius == radius) {
     return;
   }
 
-  self->point_radius = radius;
+  self->style->symbol.point_radius = radius;
   render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_POINT_RADIUS]);
+}
+
+OsmiumStyle *osmium_vector_layer_dup_style(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  return osmium_style_copy(self->style);
+}
+
+void osmium_vector_layer_set_style(OsmiumVectorLayer *self, const OsmiumStyle *style) {
+  g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
+  g_return_if_fail(style != NULL);
+
+  OsmiumStyle *copy = osmium_style_copy(style);
+
+  osmium_style_free(self->style);
+  self->style = copy;
+  invalidate_columns(self);
+  render_now(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_STROKE_COLOR]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_FILL_COLOR]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LINE_WIDTH]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_POINT_RADIUS]);
+}
+
+typedef struct {
+  char *value;
+  guint count;
+} ValueCount;
+
+static int compare_counts(gconstpointer a, gconstpointer b) {
+  const ValueCount *x = a;
+  const ValueCount *y = b;
+
+  if (x->count != y->count) {
+    return x->count < y->count ? 1 : -1;
+  }
+  return g_strcmp0(x->value, y->value);
+}
+
+char **osmium_vector_layer_dup_unique_values(OsmiumVectorLayer *self, const char *field, guint limit, gboolean *truncated) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  GPtrArray *column = column_for(self, field);
+  GHashTable *counts = g_hash_table_new(g_str_hash, g_str_equal);
+  GArray *entries = g_array_new(FALSE, FALSE, sizeof(ValueCount));
+
+  if (truncated != NULL) {
+    *truncated = FALSE;
+  }
+
+  for (guint i = 0; column != NULL && i < column->len && i < self->data->n_features; i++) {
+    const char *value = g_ptr_array_index(column, i);
+    gpointer found = g_hash_table_lookup(counts, value);
+
+    if (self->data->features[i].deleted) {
+      continue;
+    }
+    if (found != NULL) {
+      g_array_index(entries, ValueCount, GPOINTER_TO_UINT(found) - 1).count++;
+    } else {
+      ValueCount entry = {(char *)value, 1};
+
+      g_array_append_val(entries, entry);
+      g_hash_table_insert(counts, (gpointer)value, GUINT_TO_POINTER(entries->len));
+    }
+  }
+
+  g_array_sort(entries, compare_counts);
+
+  const guint n = limit > 0 ? MIN(limit, entries->len) : entries->len;
+  char **result = g_new0(char *, n + 1);
+
+  if (truncated != NULL) {
+    *truncated = n < entries->len;
+  }
+  for (guint i = 0; i < n; i++) {
+    result[i] = g_strdup(g_array_index(entries, ValueCount, i).value);
+  }
+
+  g_hash_table_destroy(counts);
+  g_array_unref(entries);
+  return result;
+}
+
+GArray *osmium_vector_layer_dup_numeric_values(OsmiumVectorLayer *self, const char *field) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  GPtrArray *column = column_for(self, field);
+  GArray *values = g_array_new(FALSE, FALSE, sizeof(double));
+
+  for (guint i = 0; column != NULL && i < column->len && i < self->data->n_features; i++) {
+    double value;
+
+    if (!self->data->features[i].deleted && parse_number(g_ptr_array_index(column, i), &value)) {
+      g_array_append_val(values, value);
+    }
+  }
+  return values;
 }
 
 guint osmium_vector_layer_get_n_features(OsmiumVectorLayer *self) {
@@ -1151,6 +1651,9 @@ static void osmium_vector_layer_dispose(GObject *object) {
   osmium_editor_finalize(self);
   g_clear_pointer(&self->selection, g_array_unref);
   g_clear_pointer(&self->selected_indices, g_array_unref);
+  g_clear_pointer(&self->style, osmium_style_free);
+  g_clear_pointer(&self->columns, g_hash_table_unref);
+  g_clear_object(&self->label_layout);
   g_clear_pointer(&self->data, osmium_vector_data_free);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
@@ -1219,16 +1722,16 @@ static void osmium_vector_layer_get_property(GObject *object,
     g_value_set_string(value, self->source_crs);
     break;
   case PROP_STROKE_COLOR:
-    g_value_set_boxed(value, &self->stroke_color);
+    g_value_set_boxed(value, &self->style->symbol.stroke);
     break;
   case PROP_FILL_COLOR:
-    g_value_set_boxed(value, &self->fill_color);
+    g_value_set_boxed(value, &self->style->symbol.fill);
     break;
   case PROP_LINE_WIDTH:
-    g_value_set_double(value, self->line_width);
+    g_value_set_double(value, self->style->symbol.line_width);
     break;
   case PROP_POINT_RADIUS:
-    g_value_set_double(value, self->point_radius);
+    g_value_set_double(value, self->style->symbol.point_radius);
     break;
   case PROP_LOADING:
     g_value_set_boolean(value, self->loading);
@@ -1289,16 +1792,19 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
 }
 
 static void osmium_vector_layer_init(OsmiumVectorLayer *self) {
+  self->style = osmium_style_new();
+  self->columns = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
+
   GtkWidget *widget = GTK_WIDGET(self);
 
-  gdk_rgba_parse(&self->stroke_color, "#1c71d8");
-  gdk_rgba_parse(&self->fill_color, "rgba(28, 113, 216, 0.35)");
+  gdk_rgba_parse(&self->style->symbol.stroke, "#1c71d8");
+  gdk_rgba_parse(&self->style->symbol.fill, "rgba(28, 113, 216, 0.35)");
   self->user_agent = g_strdup("Osmium/0.1");
   osmium_editor_init(self);
   self->selection = g_array_new(FALSE, FALSE, sizeof(gint64));
   self->selected_indices = g_array_new(FALSE, FALSE, sizeof(size_t));
-  self->line_width = OSMIUM_VECTOR_LAYER_DEFAULT_LINE_WIDTH;
-  self->point_radius = OSMIUM_VECTOR_LAYER_DEFAULT_POINT_RADIUS;
+  self->style->symbol.line_width = OSMIUM_VECTOR_LAYER_DEFAULT_LINE_WIDTH;
+  self->style->symbol.point_radius = OSMIUM_VECTOR_LAYER_DEFAULT_POINT_RADIUS;
   self->cancellable = g_cancellable_new();
 
   gtk_widget_set_can_target(widget, FALSE);

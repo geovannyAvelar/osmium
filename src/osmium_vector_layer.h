@@ -3,6 +3,7 @@
 
 #include <gtk/gtk.h>
 #include "osmium_map.h"
+#include "osmium_vector_style.h"
 
 G_BEGIN_DECLS
 
@@ -43,12 +44,6 @@ typedef enum {
   OSMIUM_SNAP_VERTEX = 1 << 0,
   OSMIUM_SNAP_SEGMENT = 1 << 1
 } OsmiumSnapMode;
-
-typedef enum {
-  OSMIUM_GEOMETRY_POINT,
-  OSMIUM_GEOMETRY_LINE,
-  OSMIUM_GEOMETRY_POLYGON
-} OsmiumGeometryKind;
 
 typedef enum {
   OSMIUM_LAYER_ISSUE_INVALID,
@@ -202,6 +197,16 @@ OSMIUM_API OsmiumFeatureClip *osmium_vector_layer_copy_selected(OsmiumVectorLaye
  * accepted. Attributes are matched by field name. Returns the number of new features. */
 OSMIUM_API guint osmium_vector_layer_paste(OsmiumVectorLayer *self, OsmiumFeatureClip *clip, double lat, double lon);
 OSMIUM_API gboolean osmium_vector_layer_can_paste(OsmiumVectorLayer *self, OsmiumFeatureClip *clip);
+
+/* The whole style, including the rules and labels. The stroke/fill/width/radius accessors above
+ * read and write the default symbol of the style. */
+OSMIUM_API OsmiumStyle *osmium_vector_layer_dup_style(OsmiumVectorLayer *self);
+OSMIUM_API void osmium_vector_layer_set_style(OsmiumVectorLayer *self, const OsmiumStyle *style);
+/* Distinct values of a field, most frequent first (limit 0 = all). NULL-terminated, free with g_strfreev. */
+OSMIUM_API char **osmium_vector_layer_dup_unique_values(OsmiumVectorLayer *self, const char *field, guint limit,
+                                                        gboolean *truncated);
+/* The values of a field that parse as numbers, as a GArray of double. */
+OSMIUM_API GArray *osmium_vector_layer_dup_numeric_values(OsmiumVectorLayer *self, const char *field);
 
 OSMIUM_API guint osmium_vector_layer_get_n_features(OsmiumVectorLayer *self);
 
