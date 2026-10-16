@@ -8,6 +8,11 @@
 
 #define OSMIUM_VECTOR_LAYER_DEFAULT_LINE_WIDTH 1.5
 #define OSMIUM_VECTOR_LAYER_DEFAULT_POINT_RADIUS 4.0
+#define OSMIUM_VECTOR_LAYER_RENDER_DELAY_MS 120
+#define OSMIUM_VECTOR_LAYER_MAX_SIZE 4096
+#define OSMIUM_VECTOR_LAYER_MARGIN 1.5
+#define OSMIUM_VECTOR_LAYER_MAX_THREADS 8
+#define OSMIUM_VECTOR_LAYER_MIN_BAND_ROWS 64
 #define OSMIUM_VECTOR_LAYER_MIN_FEATURE_SIZE 0.5
 #define OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP 0.5
 
@@ -16,6 +21,30 @@ typedef struct {
   char *user_agent;
   guint generation;
 } LoadJob;
+
+typedef struct {
+  OsmiumVectorData *data;
+  guint id;
+  guint zoom;
+  double x;
+  double y;
+  int width;
+  int height;
+  GdkRGBA stroke_color;
+  GdkRGBA fill_color;
+  double line_width;
+  double point_radius;
+} RenderJob;
+
+typedef struct {
+  GdkTexture *texture;
+  guint id;
+  guint zoom;
+  double x;
+  double y;
+  int width;
+  int height;
+} LayerImage;
 
 struct _OsmiumVectorLayer {
   GtkWidget parent_instance;
@@ -33,6 +62,9 @@ struct _OsmiumVectorLayer {
   guint generation;
   gboolean loading;
   OsmiumVectorData *data;
+  guint render_source;
+  guint last_request_id;
+  LayerImage *image;
   GCancellable *cancellable;
 };
 
@@ -59,6 +91,9 @@ static GParamSpec *properties[N_PROPS];
 enum { SIGNAL_LOAD_FAILED, N_SIGNALS };
 
 static guint signals[N_SIGNALS];
+
+static void render_now(OsmiumVectorLayer *self);
+static void image_free(gpointer data);
 
 static void set_loading(OsmiumVectorLayer *self, gboolean loading) {
   if (self->loading == loading) {
@@ -127,13 +162,14 @@ static void on_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
   self->data = loaded;
 
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_N_FEATURES]);
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  render_now(self);
 }
 
 static void start_load(OsmiumVectorLayer *self, gboolean keep_data) {
   self->generation++;
 
   if (!keep_data) {
+    g_clear_pointer(&self->image, image_free);
     g_clear_pointer(&self->data, osmium_vector_data_free);
     g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_N_FEATURES]);
     gtk_widget_queue_draw(GTK_WIDGET(self));
@@ -157,27 +193,45 @@ static void start_load(OsmiumVectorLayer *self, gboolean keep_data) {
   g_object_unref(task);
 }
 
+static void schedule_render(OsmiumVectorLayer *self);
+
 static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
+  schedule_render(OSMIUM_VECTOR_LAYER(user_data));
   gtk_widget_queue_draw(GTK_WIDGET(user_data));
 }
 
-static void append_feature(const OsmiumVectorFeature *f,
-                           GskPathBuilder *builder,
-                           double scale,
-                           double cx,
-                           double cy,
-                           double point_radius) {
+static void render_job_free(gpointer data) {
+  RenderJob *job = data;
+
+  osmium_vector_data_free(job->data);
+  g_free(job);
+}
+
+static void image_free(gpointer data) {
+  LayerImage *image = data;
+
+  if (image == NULL) {
+    return;
+  }
+  g_clear_object(&image->texture);
+  g_free(image);
+}
+
+static void trace_feature(cairo_t *cr,
+                          const OsmiumVectorFeature *f,
+                          double scale,
+                          double origin_x,
+                          double origin_y,
+                          double point_radius) {
   for (size_t p = 0; p < f->n_parts; p++) {
     const size_t start = f->part_start[p];
     const size_t end = f->part_start[p + 1];
     size_t last = end;
 
     if (f->kind == OSMIUM_VECTOR_POINT) {
-      gsk_path_builder_add_circle(
-          builder,
-          &GRAPHENE_POINT_INIT((float)(f->xy[start * 2] * scale - cx),
-                               (float)(f->xy[start * 2 + 1] * scale - cy)),
-          (float)point_radius);
+      cairo_new_sub_path(cr);
+      cairo_arc(cr, f->xy[start * 2] * scale - origin_x, f->xy[start * 2 + 1] * scale - origin_y,
+                point_radius, 0.0, 2.0 * G_PI);
       continue;
     }
 
@@ -191,21 +245,20 @@ static void append_feature(const OsmiumVectorFeature *f,
     double kept_y = 0.0;
 
     for (size_t i = start; i < last; i++) {
-      const double x = f->xy[i * 2] * scale - cx;
-      const double y = f->xy[i * 2 + 1] * scale - cy;
+      const double x = f->xy[i * 2] * scale - origin_x;
+      const double y = f->xy[i * 2 + 1] * scale - origin_y;
 
       if (i == start) {
-        gsk_path_builder_move_to(builder, (float)x, (float)y);
+        cairo_move_to(cr, x, y);
       } else {
         const double dx = x - kept_x;
         const double dy = y - kept_y;
-        const gboolean is_last = i == last - 1;
 
-        if (!is_last && dx * dx + dy * dy < OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP *
-                                                OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP) {
+        if (i != last - 1 && dx * dx + dy * dy < OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP *
+                                                    OSMIUM_VECTOR_LAYER_MIN_VERTEX_STEP) {
           continue;
         }
-        gsk_path_builder_line_to(builder, (float)x, (float)y);
+        cairo_line_to(cr, x, y);
       }
 
       kept_x = x;
@@ -213,87 +266,269 @@ static void append_feature(const OsmiumVectorFeature *f,
     }
 
     if (f->kind == OSMIUM_VECTOR_POLYGON) {
-      gsk_path_builder_close(builder);
+      cairo_close_path(cr);
     }
   }
+}
+
+static void trace_kind(cairo_t *cr,
+                       const RenderJob *job,
+                       OsmiumVectorKind kind,
+                       double scale,
+                       double origin_x,
+                       double origin_y,
+                       int height) {
+  const double reach = job->line_width + job->point_radius;
+
+  for (size_t i = 0; i < job->data->n_features; i++) {
+    const OsmiumVectorFeature *f = &job->data->features[i];
+
+    if (f->kind != kind) {
+      continue;
+    }
+
+    const double x0 = f->min_x * scale - origin_x;
+    const double x1 = f->max_x * scale - origin_x;
+    const double y0 = f->min_y * scale - origin_y;
+    const double y1 = f->max_y * scale - origin_y;
+
+    if (x1 < -reach || x0 > job->width + reach || y1 < -reach || y0 > height + reach) {
+      continue;
+    }
+
+    if (kind != OSMIUM_VECTOR_POINT &&
+        fmax(x1 - x0, y1 - y0) < OSMIUM_VECTOR_LAYER_MIN_FEATURE_SIZE) {
+      continue;
+    }
+
+    trace_feature(cr, f, scale, origin_x, origin_y, job->point_radius);
+  }
+}
+
+static void set_source(cairo_t *cr, const GdkRGBA *color) {
+  cairo_set_source_rgba(cr, color->red, color->green, color->blue, color->alpha);
+}
+
+typedef struct {
+  const RenderJob *job;
+  unsigned char *pixels;
+  int stride;
+  int first_row;
+  int rows;
+} Band;
+
+static gpointer render_band(gpointer data) {
+  Band *band = data;
+  const RenderJob *job = band->job;
+  const double scale = 256.0 * ldexp(1.0, (int)job->zoom);
+  const double origin_y = job->y + band->first_row;
+
+  cairo_surface_t *surface = cairo_image_surface_create_for_data(
+      band->pixels + (gsize)band->first_row * (gsize)band->stride, CAIRO_FORMAT_ARGB32, job->width,
+      band->rows, band->stride);
+  cairo_t *cr = cairo_create(surface);
+
+  cairo_set_line_width(cr, job->line_width);
+  cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+
+  trace_kind(cr, job, OSMIUM_VECTOR_POLYGON, scale, job->x, origin_y, band->rows);
+  cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+  set_source(cr, &job->fill_color);
+  cairo_fill_preserve(cr);
+  set_source(cr, &job->stroke_color);
+  cairo_stroke(cr);
+
+  trace_kind(cr, job, OSMIUM_VECTOR_LINE, scale, job->x, origin_y, band->rows);
+  set_source(cr, &job->stroke_color);
+  cairo_stroke(cr);
+
+  trace_kind(cr, job, OSMIUM_VECTOR_POINT, scale, job->x, origin_y, band->rows);
+  cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
+  cairo_fill(cr);
+
+  cairo_destroy(cr);
+  cairo_surface_finish(surface);
+  cairo_surface_destroy(surface);
+  return NULL;
+}
+
+static void render_worker(GTask *task, gpointer source, gpointer task_data, GCancellable *cancellable) {
+  RenderJob *job = task_data;
+
+  if (g_cancellable_is_cancelled(cancellable)) {
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "cancelled");
+    return;
+  }
+
+  const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, job->width);
+  const gsize size = (gsize)stride * (gsize)job->height;
+  unsigned char *pixels = g_malloc0(size);
+
+  /* horizontal bands render in parallel; they share nothing but the read-only data */
+  const int n_bands = CLAMP((int)g_get_num_processors(), 1, OSMIUM_VECTOR_LAYER_MAX_THREADS);
+  const int rows_per_band = (job->height + n_bands - 1) / n_bands;
+  Band bands[OSMIUM_VECTOR_LAYER_MAX_THREADS];
+  GThread *threads[OSMIUM_VECTOR_LAYER_MAX_THREADS] = {0};
+  int used = 0;
+
+  for (int first = 0; first < job->height; first += rows_per_band) {
+    Band *band = &bands[used];
+
+    band->job = job;
+    band->pixels = pixels;
+    band->stride = stride;
+    band->first_row = first;
+    band->rows = MIN(rows_per_band, job->height - first);
+
+    if (used + 1 < n_bands && job->height > 2 * OSMIUM_VECTOR_LAYER_MIN_BAND_ROWS) {
+      threads[used] = g_thread_new("osmium-vector-band", render_band, band);
+    } else {
+      render_band(band);
+    }
+    used++;
+  }
+
+  for (int i = 0; i < used; i++) {
+    if (threads[i] != NULL) {
+      g_thread_join(threads[i]);
+    }
+  }
+
+  g_autoptr(GBytes) bytes = g_bytes_new_take(pixels, size);
+  GdkTexture *texture = gdk_memory_texture_new(
+      job->width, job->height,
+      G_BYTE_ORDER == G_LITTLE_ENDIAN ? GDK_MEMORY_B8G8R8A8_PREMULTIPLIED
+                                      : GDK_MEMORY_A8R8G8B8_PREMULTIPLIED,
+      bytes, (gsize)stride);
+
+  g_task_return_pointer(task, texture, g_object_unref);
+}
+
+static void on_rendered(GObject *source, GAsyncResult *result, gpointer user_data) {
+  OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(source);
+  RenderJob *job = g_task_get_task_data(G_TASK(result));
+  g_autoptr(GError) error = NULL;
+  GdkTexture *texture = g_task_propagate_pointer(G_TASK(result), &error);
+
+  if (texture == NULL) {
+    return;
+  }
+
+  if (self->map == NULL || job->data != self->data ||
+      (self->image != NULL && self->image->id > job->id)) {
+    g_object_unref(texture);
+    return;
+  }
+
+  image_free(self->image);
+  self->image = g_new0(LayerImage, 1);
+  self->image->texture = texture;
+  self->image->id = job->id;
+  self->image->zoom = job->zoom;
+  self->image->x = job->x;
+  self->image->y = job->y;
+  self->image->width = job->width;
+  self->image->height = job->height;
+
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+static void render_now(OsmiumVectorLayer *self) {
+  GtkWidget *widget = GTK_WIDGET(self);
+  const int width = gtk_widget_get_width(widget);
+  const int height = gtk_widget_get_height(widget);
+
+  if (self->render_source != 0) {
+    g_source_remove(self->render_source);
+    self->render_source = 0;
+  }
+
+  if (self->map == NULL || self->data == NULL || self->data->n_features == 0 || width <= 0 ||
+      height <= 0) {
+    return;
+  }
+
+  const guint zoom = osmium_map_get_zoom(self->map);
+  const double rad = osmium_map_get_bearing(self->map) * G_PI / 180.0;
+  const double view_width = width * fabs(cos(rad)) + height * fabs(sin(rad));
+  const double view_height = width * fabs(sin(rad)) + height * fabs(cos(rad));
+
+  double center_x, center_y;
+  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
+                     &center_y);
+
+  RenderJob *job = g_new0(RenderJob, 1);
+  job->data = osmium_vector_data_ref(self->data);
+  job->id = ++self->last_request_id;
+  job->zoom = zoom;
+  job->width = CLAMP((int)ceil(view_width * OSMIUM_VECTOR_LAYER_MARGIN), 1, OSMIUM_VECTOR_LAYER_MAX_SIZE);
+  job->height = CLAMP((int)ceil(view_height * OSMIUM_VECTOR_LAYER_MARGIN), 1, OSMIUM_VECTOR_LAYER_MAX_SIZE);
+  job->x = floor(center_x - job->width / 2.0);
+  job->y = floor(center_y - job->height / 2.0);
+  job->stroke_color = self->stroke_color;
+  job->fill_color = self->fill_color;
+  job->line_width = self->line_width;
+  job->point_radius = self->point_radius;
+
+  GTask *task = g_task_new(self, self->cancellable, on_rendered, NULL);
+  g_task_set_task_data(task, job, render_job_free);
+  g_task_run_in_thread(task, render_worker);
+  g_object_unref(task);
+}
+
+static gboolean on_render_timeout(gpointer user_data) {
+  OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(user_data);
+
+  self->render_source = 0;
+  render_now(self);
+  return G_SOURCE_REMOVE;
+}
+
+static void schedule_render(OsmiumVectorLayer *self) {
+  if (self->render_source != 0) {
+    g_source_remove(self->render_source);
+  }
+  self->render_source = g_timeout_add(OSMIUM_VECTOR_LAYER_RENDER_DELAY_MS, on_render_timeout, self);
 }
 
 static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
   OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(widget);
 
-  if (self->map == NULL || self->data == NULL || self->data->n_features == 0) {
+  if (self->map == NULL || self->image == NULL) {
     return;
   }
 
   const float width = gtk_widget_get_width(widget);
   const float height = gtk_widget_get_height(widget);
-  const guint zoom = osmium_map_get_zoom(self->map);
   const double bearing = osmium_map_get_bearing(self->map);
-
-  double cx, cy;
-  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &cx, &cy);
-
-  const double scale = 256.0 * ldexp(1.0, (int)zoom);
-  const double reach = hypot(width, height) / 2.0 + self->line_width + self->point_radius;
-
-  GskPathBuilder *polygons = gsk_path_builder_new();
-  GskPathBuilder *lines = gsk_path_builder_new();
-  GskPathBuilder *points = gsk_path_builder_new();
-
-  for (size_t i = 0; i < self->data->n_features; i++) {
-    const OsmiumVectorFeature *f = &self->data->features[i];
-    const double x0 = f->min_x * scale - cx;
-    const double x1 = f->max_x * scale - cx;
-    const double y0 = f->min_y * scale - cy;
-    const double y1 = f->max_y * scale - cy;
-
-    if (x1 < -reach || x0 > reach || y1 < -reach || y0 > reach) {
-      continue;
-    }
-
-    if (f->kind != OSMIUM_VECTOR_POINT &&
-        fmax(x1 - x0, y1 - y0) < OSMIUM_VECTOR_LAYER_MIN_FEATURE_SIZE) {
-      continue;
-    }
-
-    GskPathBuilder *target = f->kind == OSMIUM_VECTOR_POLYGON ? polygons
-                             : f->kind == OSMIUM_VECTOR_LINE  ? lines
-                                                           : points;
-    append_feature(f, target, scale, cx, cy, self->point_radius);
-  }
-
-  GskPath *polygon_path = gsk_path_builder_free_to_path(polygons);
-  GskPath *line_path = gsk_path_builder_free_to_path(lines);
-  GskPath *point_path = gsk_path_builder_free_to_path(points);
-
-  GskStroke *stroke = gsk_stroke_new((float)self->line_width);
-  gsk_stroke_set_line_join(stroke, GSK_LINE_JOIN_ROUND);
-  gsk_stroke_set_line_cap(stroke, GSK_LINE_CAP_ROUND);
+  const guint zoom = osmium_map_get_zoom(self->map);
 
   graphene_rect_t bounds = GRAPHENE_RECT_INIT(0, 0, width, height);
   gtk_snapshot_push_clip(snapshot, &bounds);
+
+  double center_x, center_y;
+  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
+                     &center_y);
+
+  const double scale = ldexp(1.0, (int)zoom - (int)self->image->zoom);
+
   gtk_snapshot_save(snapshot);
   gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(width / 2.0f, height / 2.0f));
   gtk_snapshot_rotate(snapshot, -(float)bearing);
 
-  if (!gsk_path_is_empty(polygon_path)) {
-    gtk_snapshot_append_fill(snapshot, polygon_path, GSK_FILL_RULE_EVEN_ODD, &self->fill_color);
-    gtk_snapshot_append_stroke(snapshot, polygon_path, stroke, &self->stroke_color);
-  }
-  if (!gsk_path_is_empty(line_path)) {
-    gtk_snapshot_append_stroke(snapshot, line_path, stroke, &self->stroke_color);
-  }
-  if (!gsk_path_is_empty(point_path)) {
-    gtk_snapshot_append_fill(snapshot, point_path, GSK_FILL_RULE_WINDING, &self->stroke_color);
-  }
+  graphene_rect_t rect = GRAPHENE_RECT_INIT(self->image->x * scale - center_x,
+                                            self->image->y * scale - center_y,
+                                            self->image->width * scale,
+                                            self->image->height * scale);
+  gtk_snapshot_append_texture(snapshot, self->image->texture, &rect);
 
   gtk_snapshot_restore(snapshot);
   gtk_snapshot_pop(snapshot);
+}
 
-  gsk_stroke_free(stroke);
-  gsk_path_unref(polygon_path);
-  gsk_path_unref(line_path);
-  gsk_path_unref(point_path);
+static void osmium_vector_layer_size_allocate(GtkWidget *widget, int width, int height, int baseline) {
+  schedule_render(OSMIUM_VECTOR_LAYER(widget));
 }
 
 OsmiumMap *osmium_vector_layer_get_map(OsmiumVectorLayer *self) {
@@ -321,7 +556,8 @@ void osmium_vector_layer_set_map(OsmiumVectorLayer *self, OsmiumMap *map) {
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
   }
 
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  g_clear_pointer(&self->image, image_free);
+  schedule_render(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_MAP]);
 }
 
@@ -390,7 +626,7 @@ void osmium_vector_layer_set_stroke_color(OsmiumVectorLayer *self, const GdkRGBA
   }
 
   self->stroke_color = *color;
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_STROKE_COLOR]);
 }
 
@@ -409,7 +645,7 @@ void osmium_vector_layer_set_fill_color(OsmiumVectorLayer *self, const GdkRGBA *
   }
 
   self->fill_color = *color;
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_FILL_COLOR]);
 }
 
@@ -427,7 +663,7 @@ void osmium_vector_layer_set_line_width(OsmiumVectorLayer *self, double width) {
   }
 
   self->line_width = width;
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LINE_WIDTH]);
 }
 
@@ -445,7 +681,7 @@ void osmium_vector_layer_set_point_radius(OsmiumVectorLayer *self, double radius
   }
 
   self->point_radius = radius;
-  gtk_widget_queue_draw(GTK_WIDGET(self));
+  render_now(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_POINT_RADIUS]);
 }
 
@@ -490,7 +726,13 @@ static void osmium_vector_layer_dispose(GObject *object) {
     g_clear_weak_pointer(&self->map);
   }
 
+  if (self->render_source != 0) {
+    g_source_remove(self->render_source);
+    self->render_source = 0;
+  }
+
   g_clear_object(&self->cancellable);
+  g_clear_pointer(&self->image, image_free);
   g_clear_pointer(&self->data, osmium_vector_data_free);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
@@ -613,6 +855,7 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
                                              NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_STRING);
 
   widget_class->snapshot = osmium_vector_layer_snapshot;
+  widget_class->size_allocate = osmium_vector_layer_size_allocate;
   gtk_widget_class_set_css_name(widget_class, "osmium-vector-layer");
 }
 

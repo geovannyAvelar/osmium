@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <stdatomic.h>
 #include <stddef.h>
 
 #include "../osmium.h"
@@ -20,6 +21,7 @@ typedef struct {
 } OsmiumVectorFeature;
 
 typedef struct {
+  atomic_int refs;
   OsmiumVectorFeature *features;
   size_t n_features;
   double min_x, min_y, max_x, max_y;
@@ -28,5 +30,7 @@ typedef struct {
 osmium_error osmium_vector_data_open(const char *path,
                                      const char *user_agent,
                                      OsmiumVectorData **out);
+
+OsmiumVectorData *osmium_vector_data_ref(OsmiumVectorData *vec);
 
 void osmium_vector_data_free(OsmiumVectorData *vec);

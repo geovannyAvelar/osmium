@@ -250,6 +250,7 @@ static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
     OCTDestroyCoordinateTransformation(ct);
     return OSMIUM_OUT_OF_MEMORY;
   }
+  atomic_init(&vec->refs, 1);
 
   size_t cap = 0;
   osmium_error err = OSMIUM_OK;
@@ -355,8 +356,13 @@ osmium_error osmium_vector_data_open(const char *path,
   return err;
 }
 
+OsmiumVectorData *osmium_vector_data_ref(OsmiumVectorData *vec) {
+  atomic_fetch_add(&vec->refs, 1);
+  return vec;
+}
+
 void osmium_vector_data_free(OsmiumVectorData *vec) {
-  if (!vec) {
+  if (!vec || atomic_fetch_sub(&vec->refs, 1) != 1) {
     return;
   }
   for (size_t i = 0; i < vec->n_features; i++) {
