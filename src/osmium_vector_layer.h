@@ -20,6 +20,7 @@ typedef struct {
   char *value;
   OsmiumFeatureFieldType type;
   int width;
+  gboolean virtual_field; /* a field joined from another table; read-only */
 } OsmiumFeatureField;
 
 typedef struct {
@@ -220,6 +221,28 @@ typedef struct {
 } OsmiumAttributeTable;
 
 OSMIUM_API OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self);
+
+/* Attribute joins: fields of another table (any OGR-readable file: CSV, DBF, GeoPackage table,
+ * shapefile...) added to every feature whose target_field value equals source_field of a row of the
+ * table. The joined fields are read-only, named prefix + name, and take part in the attribute
+ * table, identify, expressions, styles and labels. */
+typedef struct {
+  char *path;
+  char *target_field;
+  char *source_field;
+  char *prefix;  /* NULL = "<file name>_" */
+  char **fields; /* NULL = every field of the table */
+} OsmiumJoin;
+
+OSMIUM_API OsmiumJoin *osmium_join_copy(const OsmiumJoin *join);
+OSMIUM_API void osmium_join_free(OsmiumJoin *join);
+OSMIUM_API OsmiumAttributeTable *osmium_table_open(const char *path, GError **error);
+OSMIUM_API gboolean osmium_vector_layer_set_joins(OsmiumVectorLayer *self, GPtrArray *joins, GError **error);
+OSMIUM_API GPtrArray *osmium_vector_layer_dup_joins(OsmiumVectorLayer *self);
+OSMIUM_API char *osmium_vector_layer_dup_join_error(OsmiumVectorLayer *self);
+/* The fields of the file plus the joined ones (virtual_field set). */
+OSMIUM_API GPtrArray *osmium_vector_layer_get_all_fields(OsmiumVectorLayer *self);
+OSMIUM_API gboolean osmium_vector_layer_is_joined_field(OsmiumVectorLayer *self, const char *name);
 OSMIUM_API void osmium_attribute_table_free(OsmiumAttributeTable *table);
 
 OSMIUM_API gboolean osmium_vector_layer_get_selection_extent(OsmiumVectorLayer *self,

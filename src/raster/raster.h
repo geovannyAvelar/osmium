@@ -30,8 +30,20 @@ void osmium_raster_get_crs_info(const OsmiumRaster *raster,
                                 int *ballpark,
                                 double *accuracy);
 
+/* Band layout of the file and the style a fresh layer starts with (free both). */
+OsmiumRasterInfo *osmium_raster_dup_info(const OsmiumRaster *raster);
+OsmiumRasterStyle *osmium_raster_dup_default_style(const OsmiumRaster *raster);
+
+/* Display range for a band by the given method. */
+osmium_error osmium_raster_compute_stretch(const OsmiumRaster *raster,
+                                           int band,
+                                           OsmiumRasterStretch mode,
+                                           double *min,
+                                           double *max);
+
 /* Renders the area (in units of target_crs) at width x height pixels as RGBA. */
 osmium_error osmium_raster_render(const OsmiumRaster *raster,
+                                  const OsmiumRasterStyle *style,
                                   const char *target_crs,
                                   double min_x,
                                   double min_y,

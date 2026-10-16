@@ -26,6 +26,7 @@ osmium_sources = [
   'src/osmium_raster_layer.c',
   'src/osmium_vector_editor.c',
   'src/osmium_vector_layer.c',
+  'src/osmium_vector_join.c',
   'src/osmium_vector_style.c',
   'src/osmium_vector_style_io.c',
   'src/osmium_tile_layer.c',

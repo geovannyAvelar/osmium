@@ -340,6 +340,7 @@ static void finish_digitizing(OsmiumVectorLayer *self) {
       g_array_set_size(e->draw_points, 0);
       osmium_vector_layer_set_selection(self, &selected, 1);
       committed(self);
+      osmium_vector_layer_emit_feature_added(self, selected);
     }
   }
 

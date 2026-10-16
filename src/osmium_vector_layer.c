@@ -66,12 +66,13 @@ enum {
 
 static GParamSpec *properties[N_PROPS];
 
-enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, SIGNAL_SELECTION_CHANGED, N_SIGNALS };
+enum { SIGNAL_LOAD_FAILED, SIGNAL_EDITING_CHANGED, SIGNAL_SELECTION_CHANGED, SIGNAL_FEATURE_ADDED, N_SIGNALS };
 
 static guint signals[N_SIGNALS];
 
 static void render_now(OsmiumVectorLayer *self);
 static void invalidate_columns(OsmiumVectorLayer *self);
+static GPtrArray *column_for(OsmiumVectorLayer *self, const char *field);
 static void rebuild_selected_indices(OsmiumVectorLayer *self);
 static void image_free(gpointer data);
 
@@ -142,6 +143,7 @@ static void on_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
 
   osmium_vector_data_free(self->data);
   self->data = loaded;
+  osmium_join_rebuild(self);
   invalidate_columns(self);
   if (self->session != NULL) {
     osmium_edit_session_free(self->session);
@@ -525,6 +527,14 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
   g_task_return_pointer(task, texture, g_object_unref);
 }
 
+void osmium_vector_layer_invalidate_columns(OsmiumVectorLayer *self) {
+  invalidate_columns(self);
+}
+
+GPtrArray *osmium_vector_layer_column(OsmiumVectorLayer *self, const char *field) {
+  return column_for(self, field);
+}
+
 static void invalidate_columns(OsmiumVectorLayer *self) {
   if (self->columns != NULL) {
     g_hash_table_remove_all(self->columns);
@@ -545,6 +555,14 @@ static GPtrArray *column_for(OsmiumVectorLayer *self, const char *field) {
 
   column = g_hash_table_lookup(self->columns, field);
   if (column != NULL && column->len == self->data->n_features) {
+    return column;
+  }
+
+  if (osmium_vector_layer_is_joined_field(self, field)) {
+    column = osmium_join_column(self, field);
+    if (column != NULL) {
+      g_hash_table_insert(self->columns, g_strdup(field), column);
+    }
     return column;
   }
 
@@ -1048,6 +1066,10 @@ void osmium_vector_layer_rebuild_selection(OsmiumVectorLayer *self) {
   rebuild_selected_indices(self);
 }
 
+void osmium_vector_layer_emit_feature_added(OsmiumVectorLayer *self, gint64 fid) {
+  g_signal_emit(self, signals[SIGNAL_FEATURE_ADDED], 0, fid);
+}
+
 void osmium_vector_layer_emit_editing_changed(OsmiumVectorLayer *self) {
   g_signal_emit(self, signals[SIGNAL_EDITING_CHANGED], 0);
 }
@@ -1148,6 +1170,19 @@ GPtrArray *osmium_vector_layer_get_feature_attributes(OsmiumVectorLayer *self, g
   }
 
   osmium_vector_fields_free(fields, n_fields);
+
+  for (guint i = 0; i < osmium_join_count_fields(self); i++) {
+    OsmiumFeatureFieldType type = OSMIUM_FEATURE_FIELD_STRING;
+    const char *name = osmium_join_field_name(self, i, &type);
+    GPtrArray *column = column_for(self, name);
+    OsmiumFeatureField *field = g_new0(OsmiumFeatureField, 1);
+
+    field->name = g_strdup(name);
+    field->value = g_strdup(column != NULL && (guint)index < column->len ? g_ptr_array_index(column, index) : "");
+    field->type = type;
+    field->virtual_field = TRUE;
+    g_ptr_array_add(result, field);
+  }
   return result;
 }
 
@@ -1218,6 +1253,13 @@ gboolean osmium_vector_layer_set_attributes(OsmiumVectorLayer *self,
 
   if (!check_writable(self, error)) {
     return FALSE;
+  }
+
+  for (guint i = 0; i < n_edits; i++) {
+    if (osmium_vector_layer_is_joined_field(self, fields[i])) {
+      g_set_error(error, G_IO_ERROR, G_IO_ERROR_READ_ONLY, "“%s” is joined from another table and can't be edited", fields[i]);
+      return FALSE;
+    }
   }
 
   OsmiumVectorEdit *edits = g_new0(OsmiumVectorEdit, n_edits);
@@ -1641,14 +1683,23 @@ OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self) {
   GHashTable *by_fid = g_hash_table_new(g_int64_hash, g_int64_equal);
   guint live = 0;
 
-  table->n_fields = fields->len;
-  table->names = g_new0(char *, fields->len + 1);
-  table->types = g_new0(OsmiumFeatureFieldType, MAX(fields->len, 1));
+  const guint real_fields = fields->len;
+  const guint joined_fields = osmium_join_count_fields(self);
+
+  table->n_fields = real_fields + joined_fields;
+  table->names = g_new0(char *, table->n_fields + 1);
+  table->types = g_new0(OsmiumFeatureFieldType, MAX(table->n_fields, 1));
   for (guint i = 0; i < fields->len; i++) {
     const OsmiumFeatureField *field = g_ptr_array_index(fields, i);
 
     table->names[i] = g_strdup(field->name);
     table->types[i] = field->type;
+  }
+  for (guint j = 0; j < joined_fields; j++) {
+    OsmiumFeatureFieldType type = OSMIUM_FEATURE_FIELD_STRING;
+
+    table->names[real_fields + j] = g_strdup(osmium_join_field_name(self, j, &type));
+    table->types[real_fields + j] = type;
   }
 
   for (size_t r = 0; r < file_rows; r++) {
@@ -1673,7 +1724,7 @@ OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self) {
       continue;
     }
     table->fids[row] = f->fid;
-    for (guint c = 0; c < table->n_fields; c++) {
+    for (guint c = 0; c < real_fields; c++) {
       const char *edited = self->session != NULL ? osmium_edit_get_override(self->session, f->fid, table->names[c]) : NULL;
       const char *value = edited;
 
@@ -1681,6 +1732,12 @@ OsmiumAttributeTable *osmium_vector_layer_dup_table(OsmiumVectorLayer *self) {
         value = file_cells[(source - 1) * file_columns + c];
       }
       table->cells[(gsize)row * table->n_fields + c] = g_strdup(value != NULL ? value : "");
+    }
+    for (guint j = 0; j < joined_fields; j++) {
+      GPtrArray *column = column_for(self, table->names[real_fields + j]);
+
+      table->cells[(gsize)row * table->n_fields + real_fields + j] =
+          g_strdup(column != NULL && i < column->len ? g_ptr_array_index(column, i) : "");
     }
     row++;
   }
@@ -1782,6 +1839,8 @@ static void osmium_vector_layer_dispose(GObject *object) {
   g_clear_pointer(&self->selected_indices, g_array_unref);
   g_clear_pointer(&self->style, osmium_style_free);
   g_clear_pointer(&self->columns, g_hash_table_unref);
+  g_clear_pointer(&self->join_configs, g_ptr_array_unref);
+  g_clear_pointer(&self->join_states, g_ptr_array_unref);
   g_clear_object(&self->label_layout);
   g_clear_pointer(&self->data, osmium_vector_data_free);
   g_clear_pointer(&self->path, g_free);
@@ -1912,6 +1971,8 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
 
   signals[SIGNAL_EDITING_CHANGED] = g_signal_new("editing-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
                                                   0, NULL, NULL, NULL, G_TYPE_NONE, 0);
+  signals[SIGNAL_FEATURE_ADDED] = g_signal_new("feature-added", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL,
+                                               NULL, G_TYPE_NONE, 1, G_TYPE_INT64);
   signals[SIGNAL_SELECTION_CHANGED] = g_signal_new("selection-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
                                                    NULL, NULL, NULL, G_TYPE_NONE, 0);
   signals[SIGNAL_LOAD_FAILED] = g_signal_new("load-failed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,

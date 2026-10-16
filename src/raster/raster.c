@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "raster.h"
 
+#include "../osmium_vector_style.h"
 #include "../proj/projection.h"
 
 #include <cpl_conv.h>
@@ -22,12 +23,10 @@ struct OsmiumRaster {
   atomic_int refs;
   char *path;
   char *user_agent;
-  int color_bands;
-  int has_alpha_band;
+  int n_bands;
+  int alpha_band;
   int expand_palette;
-  int scale;
-  double scale_min;
-  double scale_max;
+  OsmiumRasterStyle *default_style;
   double lon_min, lat_min, lon_max, lat_max;
   char *source_override;
   char *crs_definition;
@@ -187,38 +186,107 @@ static int compute_extent(GDALDatasetH dataset, OsmiumRaster *raster) {
   return 1;
 }
 
+OsmiumRasterStyle *osmium_raster_style_copy(const OsmiumRasterStyle *style) {
+  OsmiumRasterStyle *copy = malloc(sizeof(*copy));
+
+  if (!copy) {
+    return NULL;
+  }
+  *copy = *style;
+  copy->ramp = style->ramp ? strdup(style->ramp) : NULL;
+  return copy;
+}
+
+void osmium_raster_style_free(OsmiumRasterStyle *style) {
+  if (!style) {
+    return;
+  }
+  free(style->ramp);
+  free(style);
+}
+
+void osmium_raster_info_free(OsmiumRasterInfo *info) {
+  if (!info) {
+    return;
+  }
+  for (unsigned i = 0; i < info->n_bands; i++) {
+    free(info->bands[i].name);
+    free(info->bands[i].data_type);
+    free(info->bands[i].interpretation);
+  }
+  free(info->bands);
+  free(info);
+}
+
 static void plan_bands(GDALDatasetH dataset, OsmiumRaster *raster) {
   const int count = GDALGetRasterCount(dataset);
   GDALRasterBandH first = GDALGetRasterBand(dataset, 1);
+  OsmiumRasterStyle *style = calloc(1, sizeof(*style));
+  int color[3] = {1, 2, 3};
+  int n_color = 0;
 
-  if (GDALGetRasterColorTable(first) != NULL) {
-    raster->expand_palette = 1;
-    raster->color_bands = 3;
+  raster->n_bands = count;
+  raster->default_style = style;
+  if (!style) {
     return;
   }
 
-  if (count >= 4 && GDALGetRasterColorInterpretation(GDALGetRasterBand(dataset, 4)) == GCI_AlphaBand &&
-      GDALGetRasterColorInterpretation(GDALGetRasterBand(dataset, 3)) != GCI_AlphaBand) {
-    raster->color_bands = 3;
-    raster->has_alpha_band = 1;
-  } else if (count == 2 &&
-             GDALGetRasterColorInterpretation(GDALGetRasterBand(dataset, 2)) == GCI_AlphaBand) {
-    raster->color_bands = 1;
-    raster->has_alpha_band = 1;
-  } else if (count >= 3) {
-    raster->color_bands = 3;
-  } else {
-    raster->color_bands = 1;
+  for (int b = 1; b <= count; b++) {
+    if (GDALGetRasterColorInterpretation(GDALGetRasterBand(dataset, b)) == GCI_AlphaBand) {
+      raster->alpha_band = b;
+      break;
+    }
   }
 
-  if (GDALGetRasterDataType(first) != GDT_Byte) {
+  style->gamma = 1.0;
+  style->ramp = strdup("Viridis");
+  style->nodata_transparent = 1;
+  style->use_alpha_band = raster->alpha_band > 0;
+  style->range_min = 0.0;
+  style->range_max = 0.0;
+  style->min[0] = style->min[1] = style->min[2] = 0.0;
+  style->max[0] = style->max[1] = style->max[2] = 255.0;
+
+  if (GDALGetRasterColorTable(first) != NULL) {
+    raster->expand_palette = 1;
+    style->renderer = OSMIUM_RASTER_MULTIBAND_COLOR;
+    style->bands[0] = 1;
+    style->bands[1] = 2;
+    style->bands[2] = 3;
+    return;
+  }
+
+  for (int b = 1; b <= count && n_color < 3; b++) {
+    if (b != raster->alpha_band) {
+      color[n_color++] = b;
+    }
+  }
+
+  if (n_color >= 3) {
+    style->renderer = OSMIUM_RASTER_MULTIBAND_COLOR;
+    style->bands[0] = color[0];
+    style->bands[1] = color[1];
+    style->bands[2] = color[2];
+  } else {
+    style->renderer = OSMIUM_RASTER_SINGLEBAND_GRAY;
+    style->bands[0] = n_color > 0 ? color[0] : 1;
+    style->bands[1] = style->bands[2] = style->bands[0];
+  }
+
+  if (GDALGetRasterDataType(first) == GDT_Byte) {
+    style->stretch = OSMIUM_STRETCH_CUSTOM;
+    return;
+  }
+
+  {
+    const int used = style->renderer == OSMIUM_RASTER_MULTIBAND_COLOR ? 3 : 1;
     double lo = INFINITY;
     double hi = -INFINITY;
 
-    for (int b = 1; b <= raster->color_bands; b++) {
+    for (int i = 0; i < used; i++) {
       double minmax[2];
 
-      GDALComputeRasterMinMax(GDALGetRasterBand(dataset, b), TRUE, minmax);
+      GDALComputeRasterMinMax(GDALGetRasterBand(dataset, style->bands[i]), TRUE, minmax);
       lo = fmin(lo, minmax[0]);
       hi = fmax(hi, minmax[1]);
     }
@@ -231,10 +299,141 @@ static void plan_bands(GDALDatasetH dataset, OsmiumRaster *raster) {
       hi = lo + 1.0;
     }
 
-    raster->scale = 1;
-    raster->scale_min = lo;
-    raster->scale_max = hi;
+    style->stretch = OSMIUM_STRETCH_MIN_MAX;
+    for (int i = 0; i < 3; i++) {
+      style->min[i] = lo;
+      style->max[i] = hi;
+    }
   }
+}
+
+OsmiumRasterStyle *osmium_raster_dup_default_style(const OsmiumRaster *raster) {
+  return raster->default_style ? osmium_raster_style_copy(raster->default_style) : NULL;
+}
+
+OsmiumRasterInfo *osmium_raster_dup_info(const OsmiumRaster *raster) {
+  GDALDatasetH dataset = open_dataset(raster);
+  OsmiumRasterInfo *info;
+
+  if (!dataset) {
+    return NULL;
+  }
+
+  info = calloc(1, sizeof(*info));
+  if (!info) {
+    GDALClose(dataset);
+    return NULL;
+  }
+
+  info->width = (unsigned)GDALGetRasterXSize(dataset);
+  info->height = (unsigned)GDALGetRasterYSize(dataset);
+  info->n_bands = (unsigned)GDALGetRasterCount(dataset);
+  info->alpha_band = raster->alpha_band;
+  info->palette = raster->expand_palette;
+  info->bands = calloc(info->n_bands ? info->n_bands : 1, sizeof(*info->bands));
+
+  for (unsigned i = 0; info->bands && i < info->n_bands; i++) {
+    GDALRasterBandH band = GDALGetRasterBand(dataset, (int)i + 1);
+    const char *description = GDALGetDescription(band);
+    int has_nodata = 0;
+    double nodata = GDALGetRasterNoDataValue(band, &has_nodata);
+    char name[96];
+
+    if (description && *description) {
+      snprintf(name, sizeof(name), "Band %u — %s", i + 1, description);
+    } else {
+      snprintf(name, sizeof(name), "Band %u", i + 1);
+    }
+    info->bands[i].name = strdup(name);
+    info->bands[i].data_type = strdup(GDALGetDataTypeName(GDALGetRasterDataType(band)));
+    info->bands[i].interpretation = strdup(GDALGetColorInterpretationName(GDALGetRasterColorInterpretation(band)));
+    info->bands[i].has_nodata = has_nodata;
+    info->bands[i].nodata = nodata;
+  }
+
+  GDALClose(dataset);
+  return info;
+}
+
+osmium_error osmium_raster_compute_stretch(const OsmiumRaster *raster,
+                                           int band_number,
+                                           OsmiumRasterStretch mode,
+                                           double *min,
+                                           double *max) {
+  GDALDatasetH dataset = open_dataset(raster);
+  GDALRasterBandH band;
+  double lo = 0.0, hi = 1.0;
+  osmium_error result = OSMIUM_OK;
+
+  if (!dataset) {
+    return OSMIUM_FILE_ERROR;
+  }
+  if (band_number < 1 || band_number > GDALGetRasterCount(dataset)) {
+    GDALClose(dataset);
+    return OSMIUM_NULL_POINTER;
+  }
+  band = GDALGetRasterBand(dataset, band_number);
+
+  {
+    double minmax[2] = {0, 0};
+
+    if (GDALComputeRasterMinMax(band, TRUE, minmax) != CE_None) {
+      GDALClose(dataset);
+      return OSMIUM_FILE_ERROR;
+    }
+    lo = minmax[0];
+    hi = minmax[1];
+  }
+
+  if (mode == OSMIUM_STRETCH_PERCENT_CUT && hi > lo) {
+    const int buckets = 1024;
+    GUIntBig *histogram = calloc((size_t)buckets, sizeof(*histogram));
+
+    if (histogram && GDALGetRasterHistogramEx(band, lo, hi, buckets, histogram, FALSE, TRUE, NULL, NULL) == CE_None) {
+      double total = 0.0;
+      double running = 0.0;
+      double cut_low = lo, cut_high = hi;
+      int found_low = 0;
+
+      for (int i = 0; i < buckets; i++) {
+        total += (double)histogram[i];
+      }
+      for (int i = 0; i < buckets && total > 0.0; i++) {
+        running += (double)histogram[i];
+        if (!found_low && running / total >= 0.02) {
+          cut_low = lo + (hi - lo) * i / buckets;
+          found_low = 1;
+        }
+        if (running / total >= 0.98) {
+          cut_high = lo + (hi - lo) * (i + 1) / buckets;
+          break;
+        }
+      }
+      lo = cut_low;
+      hi = cut_high;
+    }
+    free(histogram);
+  } else if (mode == OSMIUM_STRETCH_STD_DEV) {
+    double smin, smax, mean, sd;
+
+    if (GDALComputeRasterStatistics(band, TRUE, &smin, &smax, &mean, &sd, NULL, NULL) == CE_None) {
+      lo = fmax(smin, mean - 2.0 * sd);
+      hi = fmin(smax, mean + 2.0 * sd);
+    }
+  }
+
+  if (!isfinite(lo) || !isfinite(hi)) {
+    result = OSMIUM_FILE_ERROR;
+  } else {
+    if (hi <= lo) {
+      hi = lo + 1.0;
+    }
+    *min = lo;
+    *max = hi;
+  }
+
+  GDALClose(dataset);
+  return result;
 }
 
 osmium_error osmium_raster_open(const char *path,
@@ -317,6 +516,7 @@ void osmium_raster_unref(OsmiumRaster *raster) {
   free(raster->crs_definition);
   free(raster->crs_name);
   free(raster->crs_code);
+  osmium_raster_style_free(raster->default_style);
   free(raster);
 }
 
@@ -344,7 +544,35 @@ void osmium_raster_get_crs_info(const OsmiumRaster *raster,
   *accuracy = raster->crs_accuracy;
 }
 
-static GDALDatasetH make_source_vrt(const OsmiumRaster *raster, GDALDatasetH source) {
+typedef struct {
+  int colors;
+  int bands[3];
+  int alpha;
+} BandPlan;
+
+static BandPlan plan_for_style(const OsmiumRaster *raster, const OsmiumRasterStyle *style) {
+  BandPlan plan = {.colors = style->renderer == OSMIUM_RASTER_MULTIBAND_COLOR ? 3 : 1};
+
+  for (int i = 0; i < 3; i++) {
+    int band = style->bands[i];
+
+    plan.bands[i] = band < 1 ? 1 : (band > raster->n_bands ? raster->n_bands : band);
+  }
+  if (style->use_alpha_band && raster->alpha_band > 0) {
+    plan.alpha = raster->alpha_band;
+    for (int i = 0; i < plan.colors; i++) {
+      if (plan.bands[i] == plan.alpha) {
+        plan.alpha = 0;
+      }
+    }
+  }
+  return plan;
+}
+
+static GDALDatasetH make_source_vrt(const OsmiumRaster *raster,
+                                    const OsmiumRasterStyle *style,
+                                    const BandPlan *plan,
+                                    GDALDatasetH source) {
   char **argv = NULL;
 
   argv = CSLAddString(argv, "-of");
@@ -354,19 +582,30 @@ static GDALDatasetH make_source_vrt(const OsmiumRaster *raster, GDALDatasetH sou
     argv = CSLAddString(argv, "-expand");
     argv = CSLAddString(argv, "rgb");
   } else {
-    for (int b = 1; b <= raster->color_bands; b++) {
+    for (int i = 0; i < plan->colors; i++) {
       char band[16];
 
-      snprintf(band, sizeof(band), "%d", b);
+      snprintf(band, sizeof(band), "%d", plan->bands[i]);
       argv = CSLAddString(argv, "-b");
       argv = CSLAddString(argv, band);
     }
-    if (raster->has_alpha_band) {
+    if (plan->alpha > 0) {
       char band[16];
 
-      snprintf(band, sizeof(band), "%d", raster->color_bands + 1);
+      snprintf(band, sizeof(band), "%d", plan->alpha);
       argv = CSLAddString(argv, "-b");
       argv = CSLAddString(argv, band);
+    }
+
+    if (!style->nodata_transparent) {
+      argv = CSLAddString(argv, "-a_nodata");
+      argv = CSLAddString(argv, "none");
+    } else if (style->custom_nodata) {
+      char *value = format_double(style->nodata);
+
+      argv = CSLAddString(argv, "-a_nodata");
+      argv = CSLAddString(argv, value ? value : "0");
+      free(value);
     }
   }
 
@@ -416,7 +655,7 @@ static GDALDatasetH warp_to_view(const OsmiumRaster *raster,
   argv = CSLAddString(argv, raster->expand_palette ? "near" : "bilinear");
   argv = CSLAddString(argv, "-dstalpha");
   argv = CSLAddString(argv, "-ot");
-  argv = CSLAddString(argv, raster->scale ? "Float32" : "Byte");
+  argv = CSLAddString(argv, raster->expand_palette ? "Byte" : "Float32");
 
   GDALWarpAppOptions *options = GDALWarpAppOptionsNew(argv, NULL);
   CSLDestroy(argv);
@@ -438,7 +677,24 @@ static unsigned char to_byte(float value, double lo, double span) {
   return scaled >= 255.0 ? 255 : (unsigned char)(scaled + 0.5);
 }
 
+static unsigned char stretch_byte(float value, double lo, double hi, double gamma) {
+  const double span = hi > lo ? hi - lo : 1.0;
+  double t = ((double)value - lo) / span;
+
+  if (!(t > 0.0)) {
+    return 0;
+  }
+  if (t >= 1.0) {
+    return 255;
+  }
+  if (gamma > 0.0 && gamma != 1.0) {
+    t = pow(t, 1.0 / gamma);
+  }
+  return (unsigned char)(t * 255.0 + 0.5);
+}
+
 osmium_error osmium_raster_render(const OsmiumRaster *raster,
+                                  const OsmiumRasterStyle *style_in,
                                   const char *target_crs,
                                   double min_x,
                                   double min_y,
@@ -452,12 +708,19 @@ osmium_error osmium_raster_render(const OsmiumRaster *raster,
   }
   *rgba = NULL;
 
+  const OsmiumRasterStyle *style = style_in ? style_in : raster->default_style;
+
+  if (!style) {
+    return OSMIUM_NULL_POINTER;
+  }
+
+  const BandPlan plan = plan_for_style(raster, style);
   GDALDatasetH source = open_dataset(raster);
   if (!source) {
     return OSMIUM_FILE_ERROR;
   }
 
-  GDALDatasetH vrt = make_source_vrt(raster, source);
+  GDALDatasetH vrt = make_source_vrt(raster, style, &plan, source);
   if (!vrt) {
     GDALClose(source);
     return OSMIUM_FILE_ERROR;
@@ -470,7 +733,7 @@ osmium_error osmium_raster_render(const OsmiumRaster *raster,
     return OSMIUM_FILE_ERROR;
   }
 
-  const int colors = raster->color_bands;
+  const int colors = raster->expand_palette ? 3 : plan.colors;
   const size_t pixels = (size_t)width * (size_t)height;
 
   if (GDALGetRasterCount(warped) != colors + 1) {
@@ -478,50 +741,99 @@ osmium_error osmium_raster_render(const OsmiumRaster *raster,
     return OSMIUM_FILE_ERROR;
   }
 
-  unsigned char *out = malloc(pixels * 4);
+  unsigned char *out = calloc(pixels, 4);
   float *plane = malloc(pixels * sizeof(float));
-  if (!out || !plane) {
+  unsigned char *alpha = malloc(pixels);
+  float *first = NULL;
+  if (!out || !plane || !alpha) {
     free(out);
     free(plane);
+    free(alpha);
     GDALClose(warped);
     return OSMIUM_OUT_OF_MEMORY;
   }
+  memset(alpha, 255, pixels);
 
-  const double lo = raster->scale ? raster->scale_min : 0.0;
-  const double span = raster->scale ? raster->scale_max - raster->scale_min : 255.0;
+  if (style->range_transparent || style->renderer == OSMIUM_RASTER_SINGLEBAND_PSEUDOCOLOR) {
+    first = malloc(pixels * sizeof(float));
+  }
+
   osmium_error result = OSMIUM_OK;
+  unsigned char lut[256][3];
+
+  if (!raster->expand_palette && style->renderer == OSMIUM_RASTER_SINGLEBAND_PSEUDOCOLOR) {
+    for (int i = 0; i < 256; i++) {
+      GdkRGBA color;
+
+      osmium_color_ramp_sample(style->ramp ? style->ramp : "Viridis", style->invert ? 1.0 - i / 255.0 : i / 255.0,
+                               &color);
+      lut[i][0] = (unsigned char)(color.red * 255.0 + 0.5);
+      lut[i][1] = (unsigned char)(color.green * 255.0 + 0.5);
+      lut[i][2] = (unsigned char)(color.blue * 255.0 + 0.5);
+    }
+  }
 
   for (int c = 0; c < colors && result == OSMIUM_OK; c++) {
-    if (GDALRasterIO(GDALGetRasterBand(warped, c + 1), GF_Read, 0, 0, width, height, plane, width,
-                     height, GDT_Float32, 0, 0) != CE_None) {
+    if (GDALRasterIO(GDALGetRasterBand(warped, c + 1), GF_Read, 0, 0, width, height, plane, width, height,
+                     GDT_Float32, 0, 0) != CE_None) {
       result = OSMIUM_FILE_ERROR;
       break;
     }
 
-    for (size_t i = 0; i < pixels; i++) {
-      const unsigned char v = to_byte(plane[i], lo, span);
+    if (c == 0 && first) {
+      memcpy(first, plane, pixels * sizeof(float));
+    }
 
+    if (raster->expand_palette) {
+      for (size_t i = 0; i < pixels; i++) {
+        out[i * 4 + c] = to_byte(plane[i], 0.0, 255.0);
+      }
+      continue;
+    }
+
+    for (size_t i = 0; i < pixels; i++) {
+      if (!isfinite(plane[i])) {
+        alpha[i] = 0;
+        continue;
+      }
       if (colors == 1) {
-        out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = v;
+        const unsigned char v = stretch_byte(plane[i], style->min[0], style->max[0], style->gamma);
+
+        if (style->renderer == OSMIUM_RASTER_SINGLEBAND_PSEUDOCOLOR) {
+          out[i * 4] = lut[v][0];
+          out[i * 4 + 1] = lut[v][1];
+          out[i * 4 + 2] = lut[v][2];
+        } else {
+          out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = v;
+        }
       } else {
-        out[i * 4 + c] = v;
+        out[i * 4 + c] = stretch_byte(plane[i], style->min[c], style->max[c], style->gamma);
       }
     }
   }
 
   if (result == OSMIUM_OK &&
-      GDALRasterIO(GDALGetRasterBand(warped, colors + 1), GF_Read, 0, 0, width, height, plane, width,
-                   height, GDT_Float32, 0, 0) != CE_None) {
+      GDALRasterIO(GDALGetRasterBand(warped, colors + 1), GF_Read, 0, 0, width, height, plane, width, height,
+                   GDT_Float32, 0, 0) != CE_None) {
     result = OSMIUM_FILE_ERROR;
   }
 
   if (result == OSMIUM_OK) {
     for (size_t i = 0; i < pixels; i++) {
-      out[i * 4 + 3] = to_byte(plane[i], 0.0, 255.0);
+      const unsigned char a = to_byte(plane[i], 0.0, 255.0);
+
+      alpha[i] = alpha[i] < a ? alpha[i] : a;
+      if (first && style->range_transparent && !raster->expand_palette && first[i] >= style->range_min &&
+          first[i] <= style->range_max) {
+        alpha[i] = 0;
+      }
+      out[i * 4 + 3] = alpha[i];
     }
   }
 
   free(plane);
+  free(alpha);
+  free(first);
   GDALClose(warped);
 
   if (result != OSMIUM_OK) {

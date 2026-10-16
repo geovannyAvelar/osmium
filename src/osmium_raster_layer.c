@@ -19,6 +19,7 @@ typedef struct {
 
 typedef struct {
   OsmiumRaster *raster;
+  OsmiumRasterStyle *style;
   OsmiumProjection *projection;
   guint id;
   guint zoom;
@@ -52,6 +53,7 @@ struct _OsmiumRasterLayer {
 
   guint generation;
   OsmiumRaster *raster;
+  OsmiumRasterStyle *style;
   guint reload_source;
   guint last_request_id;
   RasterImage *image;
@@ -94,6 +96,7 @@ static void render_job_free(gpointer data) {
   RenderJob *job = data;
 
   osmium_raster_unref(job->raster);
+  osmium_raster_style_free(job->style);
   g_clear_pointer(&job->projection, osmium_projection_unref);
   g_free(job);
 }
@@ -195,7 +198,7 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
   osmium_projection_normalized_to_units(job->projection, (job->x + job->width) / world,
                                         (job->y + job->height) / world, &right, &bottom);
 
-  osmium_error err = osmium_raster_render(job->raster, osmium_projection_get_definition(job->projection),
+  osmium_error err = osmium_raster_render(job->raster, job->style, osmium_projection_get_definition(job->projection),
                                           MIN(left, right), MIN(top, bottom), MAX(left, right),
                                           MAX(top, bottom), job->width, job->height, &rgba);
   if (err != OSMIUM_OK) {
@@ -299,6 +302,7 @@ static void render_now(OsmiumRasterLayer *self) {
 
   RenderJob *job = g_new0(RenderJob, 1);
   job->raster = osmium_raster_ref(self->raster);
+  job->style = self->style != NULL ? osmium_raster_style_copy(self->style) : NULL;
   job->projection = osmium_projection_ref(osmium_map_get_projection(self->map));
   job->id = ++self->last_request_id;
   job->zoom = zoom;
@@ -504,6 +508,40 @@ gboolean osmium_raster_layer_get_crs_info(OsmiumRasterLayer *self, OsmiumLayerCr
   return TRUE;
 }
 
+OsmiumRasterInfo *osmium_raster_layer_dup_info(OsmiumRasterLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_RASTER_LAYER(self), NULL);
+
+  return self->raster != NULL ? osmium_raster_dup_info(self->raster) : NULL;
+}
+
+OsmiumRasterStyle *osmium_raster_layer_dup_style(OsmiumRasterLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_RASTER_LAYER(self), NULL);
+
+  if (self->style != NULL) {
+    return osmium_raster_style_copy(self->style);
+  }
+  return self->raster != NULL ? osmium_raster_dup_default_style(self->raster) : NULL;
+}
+
+void osmium_raster_layer_set_style(OsmiumRasterLayer *self, const OsmiumRasterStyle *style) {
+  g_return_if_fail(OSMIUM_IS_RASTER_LAYER(self));
+  g_return_if_fail(style != NULL);
+
+  osmium_raster_style_free(self->style);
+  self->style = osmium_raster_style_copy(style);
+  osmium_raster_layer_schedule_render(self);
+}
+
+gboolean osmium_raster_layer_compute_stretch(OsmiumRasterLayer *self,
+                                             int band,
+                                             OsmiumRasterStretch mode,
+                                             double *min,
+                                             double *max) {
+  g_return_val_if_fail(OSMIUM_IS_RASTER_LAYER(self), FALSE);
+
+  return self->raster != NULL && osmium_raster_compute_stretch(self->raster, band, mode, min, max) == OSMIUM_OK;
+}
+
 void osmium_raster_layer_reload(OsmiumRasterLayer *self) {
   g_return_if_fail(OSMIUM_IS_RASTER_LAYER(self));
 
@@ -554,6 +592,7 @@ static void osmium_raster_layer_dispose(GObject *object) {
   g_clear_object(&self->cancellable);
   g_clear_pointer(&self->image, image_free);
   g_clear_pointer(&self->raster, osmium_raster_unref);
+  g_clear_pointer(&self->style, osmium_raster_style_free);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
   g_clear_pointer(&self->source_crs, g_free);

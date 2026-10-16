@@ -63,6 +63,8 @@ struct _OsmiumVectorLayer {
   char *source_crs;
   OsmiumStyle *style;
   GHashTable *columns;
+  GPtrArray *join_configs; /* OsmiumJoin */
+  GPtrArray *join_states;  /* JoinState, see osmium_vector_join.c */
   PangoLayout *label_layout;
 
   guint generation;
@@ -84,9 +86,18 @@ struct _OsmiumVectorLayer {
 void osmium_vector_layer_refresh(OsmiumVectorLayer *self);
 void osmium_vector_layer_rebuild_selection(OsmiumVectorLayer *self);
 void osmium_vector_layer_emit_editing_changed(OsmiumVectorLayer *self);
+void osmium_vector_layer_emit_feature_added(OsmiumVectorLayer *self, gint64 fid);
 
 void osmium_editor_init(OsmiumVectorLayer *self);
 void osmium_editor_finalize(OsmiumVectorLayer *self);
 void osmium_editor_attach(OsmiumVectorLayer *self, OsmiumMap *map);
 void osmium_editor_detach(OsmiumVectorLayer *self, OsmiumMap *map);
 void osmium_editor_draw(OsmiumVectorLayer *self, GtkSnapshot *snapshot, float width, float height, double center_x, double center_y);
+
+void osmium_vector_layer_invalidate_columns(OsmiumVectorLayer *self);
+GPtrArray *osmium_vector_layer_column(OsmiumVectorLayer *self, const char *field);
+
+void osmium_join_rebuild(OsmiumVectorLayer *self);
+guint osmium_join_count_fields(OsmiumVectorLayer *self);
+const char *osmium_join_field_name(OsmiumVectorLayer *self, guint index, OsmiumFeatureFieldType *type);
+GPtrArray *osmium_join_column(OsmiumVectorLayer *self, const char *name);
