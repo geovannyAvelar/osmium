@@ -33,6 +33,11 @@ OSMIUM_API void osmium_wms_layer_set_version(OsmiumWmsLayer *self, const char *v
 OSMIUM_API const char *osmium_wms_layer_get_user_agent(OsmiumWmsLayer *self);
 OSMIUM_API void osmium_wms_layer_set_user_agent(OsmiumWmsLayer *self, const char *user_agent);
 
+/* Coordinate systems the server can draw in. The layer requests the map's own when listed and
+ * reprojects the image otherwise. */
+OSMIUM_API const char *const *osmium_wms_layer_get_supported_crs(OsmiumWmsLayer *self);
+OSMIUM_API void osmium_wms_layer_set_supported_crs(OsmiumWmsLayer *self, const char *const *crs);
+
 OSMIUM_API gboolean osmium_wms_layer_get_transparent(OsmiumWmsLayer *self);
 OSMIUM_API void osmium_wms_layer_set_transparent(OsmiumWmsLayer *self, gboolean transparent);
 

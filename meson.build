@@ -14,17 +14,20 @@ xml_dep = dependency('libxml-2.0')
 m_dep = cc.find_library('m', required: false)
 libxml_dep = dependency('libxml-2.0')
 gdal_dep = dependency('gdal')
+proj_dep = dependency('proj')
 
 add_project_arguments('-fvisibility=hidden', '-Wno-unused-parameter', language: 'c')
 
 osmium_sources = [
   'src/osmium_compass.c',
+  'src/osmium_crs.c',
   'src/osmium_map.c',
   'src/osmium_raster_layer.c',
   'src/osmium_vector_layer.c',
   'src/osmium_tile_layer.c',
   'src/osmium_wms_layer.c',
   'src/osmium_zoom_control.c',
+  'src/proj/projection.c',
   'src/raster/raster.c',
   'src/vector/vector_data.c',
   'src/tms/tms.c',
@@ -34,6 +37,7 @@ osmium_sources = [
 osmium_headers = [
   'src/osmium.h',
   'src/osmium_compass.h',
+  'src/osmium_crs.h',
   'src/osmium_map.h',
   'src/osmium_raster_layer.h',
   'src/osmium_vector_layer.h',
@@ -47,7 +51,7 @@ osmium_inc = include_directories('src')
 libosmium = shared_library('osmium', osmium_sources,
   version: meson.project_version(),
   soversion: '0',
-  dependencies: [gtk_dep, curl_dep, m_dep, libxml_dep, gdal_dep],
+  dependencies: [gtk_dep, curl_dep, m_dep, libxml_dep, gdal_dep, proj_dep],
   include_directories: osmium_inc,
   install: true,
 )

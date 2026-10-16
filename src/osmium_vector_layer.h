@@ -21,6 +21,16 @@ typedef struct {
   int width;
 } OsmiumFeatureField;
 
+typedef struct {
+  char *name;
+  char *code;
+  gboolean assumed;
+  gboolean ballpark;
+  double accuracy;
+} OsmiumLayerCrsInfo;
+
+OSMIUM_API void osmium_layer_crs_info_clear(OsmiumLayerCrsInfo *info);
+
 OSMIUM_API void osmium_feature_field_free(OsmiumFeatureField *field);
 
 #define OSMIUM_TYPE_VECTOR_LAYER (osmium_vector_layer_get_type())
@@ -34,6 +44,14 @@ OSMIUM_API void osmium_vector_layer_set_map(OsmiumVectorLayer *self, OsmiumMap *
 
 OSMIUM_API const char *osmium_vector_layer_get_path(OsmiumVectorLayer *self);
 OSMIUM_API void osmium_vector_layer_set_path(OsmiumVectorLayer *self, const char *path);
+
+/* Overrides the coordinate system stored in the file; NULL or "" uses the file's. */
+OSMIUM_API const char *osmium_vector_layer_get_source_crs(OsmiumVectorLayer *self);
+OSMIUM_API void osmium_vector_layer_set_source_crs(OsmiumVectorLayer *self, const char *source_crs);
+
+/* Coordinate system the data was read in, and how reliable the datum shift to WGS 84 is.
+ * name and code are NULL-able and owned by the caller (see osmium_layer_crs_info_clear). */
+OSMIUM_API gboolean osmium_vector_layer_get_crs_info(OsmiumVectorLayer *self, OsmiumLayerCrsInfo *info);
 
 OSMIUM_API void osmium_vector_layer_reload(OsmiumVectorLayer *self);
 OSMIUM_API gboolean osmium_vector_layer_get_loading(OsmiumVectorLayer *self);

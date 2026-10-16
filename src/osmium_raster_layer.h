@@ -3,6 +3,7 @@
 
 #include <gtk/gtk.h>
 #include "osmium_map.h"
+#include "osmium_vector_layer.h"
 
 G_BEGIN_DECLS
 
@@ -20,6 +21,10 @@ OSMIUM_API void osmium_raster_layer_set_path(OsmiumRasterLayer *self, const char
 
 OSMIUM_API const char *osmium_raster_layer_get_user_agent(OsmiumRasterLayer *self);
 OSMIUM_API void osmium_raster_layer_set_user_agent(OsmiumRasterLayer *self, const char *user_agent);
+
+OSMIUM_API const char *osmium_raster_layer_get_source_crs(OsmiumRasterLayer *self);
+OSMIUM_API void osmium_raster_layer_set_source_crs(OsmiumRasterLayer *self, const char *source_crs);
+OSMIUM_API gboolean osmium_raster_layer_get_crs_info(OsmiumRasterLayer *self, OsmiumLayerCrsInfo *info);
 
 OSMIUM_API void osmium_raster_layer_reload(OsmiumRasterLayer *self);
 OSMIUM_API gboolean osmium_raster_layer_get_loading(OsmiumRasterLayer *self);

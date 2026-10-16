@@ -2,6 +2,8 @@
 
 #include "osmium_map.h"
 
+#include "osmium_map_private.h"
+#include "proj/projection.h"
 #include "tms/tms.h"
 #include <math.h>
 
@@ -18,6 +20,9 @@ struct _OsmiumMap {
   gdouble lat;
   gdouble lon;
   guint zoom;
+
+  OsmiumProjection *projection;
+  char *crs;
 
   double drag_last_x;
   double drag_last_y;
@@ -50,7 +55,7 @@ G_DEFINE_TYPE_WITH_CODE(OsmiumMap,
                         GTK_TYPE_WIDGET,
                         G_IMPLEMENT_INTERFACE(GTK_TYPE_BUILDABLE, osmium_map_buildable_init))
 
-enum { PROP_0, PROP_LAT, PROP_LON, PROP_ZOOM, PROP_BEARING, N_PROPS };
+enum { PROP_0, PROP_LAT, PROP_LON, PROP_ZOOM, PROP_BEARING, PROP_CRS, N_PROPS };
 
 #define OSMIUM_MAP_CLICK_SLOP 5.0
 
@@ -68,6 +73,8 @@ static void osmium_map_dispose(GObject *object) {
   g_clear_pointer(&self->overlays, g_list_free);
 
   g_clear_object(&self->coordinates_text);
+  g_clear_pointer(&self->projection, osmium_projection_unref);
+  g_clear_pointer(&self->crs, g_free);
 
   G_OBJECT_CLASS(osmium_map_parent_class)->dispose(object);
 }
@@ -149,6 +156,32 @@ static void osmium_map_view_changed(OsmiumMap *self) {
   g_signal_emit(self, signals[SIGNAL_VIEW_CHANGED], 0);
 }
 
+static double world_size(guint zoom) {
+  return 256.0 * ldexp(1.0, (int)zoom);
+}
+
+void osmium_map_lonlat_to_world(OsmiumMap *self, double lat, double lon, guint zoom, double *px, double *py) {
+  double nx = 0.5;
+  double ny = 0.5;
+
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  if (!osmium_projection_forward(self->projection, lon, lat, &nx, &ny)) {
+    nx = ny = 0.5;
+  }
+  *px = nx * world_size(zoom);
+  *py = ny * world_size(zoom);
+}
+
+void osmium_map_world_to_lonlat(OsmiumMap *self, double px, double py, guint zoom, double *lat, double *lon) {
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  if (!osmium_projection_inverse(self->projection, px / world_size(zoom), py / world_size(zoom), lon, lat)) {
+    *lat = self->lat;
+    *lon = self->lon;
+  }
+}
+
 void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *lat, double *lon) {
   double cx, cy;
 
@@ -160,8 +193,8 @@ void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *la
   const double world_dx = dx * cos(rad) - dy * sin(rad);
   const double world_dy = dx * sin(rad) + dy * cos(rad);
 
-  osmium_world_pixel(self->lat, self->lon, self->zoom, &cx, &cy);
-  osmium_world_pixel_to_latlon(cx + world_dx, cy + world_dy, self->zoom, lat, lon);
+  osmium_map_lonlat_to_world(self, self->lat, self->lon, self->zoom, &cx, &cy);
+  osmium_map_world_to_lonlat(self, cx + world_dx, cy + world_dy, self->zoom, lat, lon);
 }
 
 static void on_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
@@ -193,9 +226,8 @@ static void osmium_map_pan(OsmiumMap *self, double dx_px, double dy_px) {
   const double world_dx = dx_px * cos(rad) - dy_px * sin(rad);
   const double world_dy = dx_px * sin(rad) + dy_px * cos(rad);
 
-  osmium_world_pixel(self->lat, self->lon, self->zoom, &cx, &cy);
-  osmium_world_pixel_to_latlon(
-      cx + world_dx, cy + world_dy, self->zoom, &self->lat, &self->lon);
+  osmium_map_lonlat_to_world(self, self->lat, self->lon, self->zoom, &cx, &cy);
+  osmium_map_world_to_lonlat(self, cx + world_dx, cy + world_dy, self->zoom, &self->lat, &self->lon);
 }
 
 static gboolean on_key_pressed(GtkEventControllerKey *controller,
@@ -340,6 +372,59 @@ void osmium_map_set_bearing(OsmiumMap *self, double bearing) {
   osmium_map_view_changed(self);
 }
 
+OsmiumProjection *osmium_map_get_projection(OsmiumMap *self) {
+  return self->projection;
+}
+
+const char *osmium_map_get_crs(OsmiumMap *self) {
+  g_return_val_if_fail(OSMIUM_IS_MAP(self), NULL);
+
+  return self->crs;
+}
+
+gboolean osmium_map_set_crs(OsmiumMap *self, const char *crs) {
+  char message[128];
+
+  g_return_val_if_fail(OSMIUM_IS_MAP(self), FALSE);
+  g_return_val_if_fail(crs != NULL, FALSE);
+
+  if (g_strcmp0(self->crs, crs) == 0) {
+    return TRUE;
+  }
+
+  OsmiumProjection *projection = osmium_projection_new(crs, message, sizeof(message));
+  if (projection == NULL) {
+    return FALSE;
+  }
+
+  osmium_projection_unref(self->projection);
+  self->projection = projection;
+  g_free(self->crs);
+  self->crs = g_strdup(crs);
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_CRS]);
+  osmium_map_view_changed(self);
+  return TRUE;
+}
+
+const char *osmium_map_get_crs_name(OsmiumMap *self) {
+  g_return_val_if_fail(OSMIUM_IS_MAP(self), NULL);
+
+  return osmium_projection_get_name(self->projection);
+}
+
+gboolean osmium_map_crs_is_web_mercator(OsmiumMap *self) {
+  g_return_val_if_fail(OSMIUM_IS_MAP(self), FALSE);
+
+  return osmium_projection_is_web_mercator(self->projection);
+}
+
+void osmium_map_normalized_to_units(OsmiumMap *self, double nx, double ny, double *x, double *y) {
+  g_return_if_fail(OSMIUM_IS_MAP(self));
+
+  osmium_projection_normalized_to_units(self->projection, nx, ny, x, y);
+}
+
 void osmium_map_add_overlay(OsmiumMap *self, GtkWidget *child) {
   g_return_if_fail(OSMIUM_IS_MAP(self));
   g_return_if_fail(GTK_IS_WIDGET(child));
@@ -405,6 +490,11 @@ static void osmium_map_set_property(GObject *object,
   case PROP_BEARING:
     osmium_map_set_bearing(self, g_value_get_double(value));
     break;
+  case PROP_CRS:
+    if (g_value_get_string(value) != NULL && !osmium_map_set_crs(self, g_value_get_string(value))) {
+      g_warning("Unknown coordinate system %s", g_value_get_string(value));
+    }
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
@@ -425,6 +515,9 @@ static void osmium_map_get_property(GObject *object,
     break;
   case PROP_ZOOM:
     g_value_set_uint(value, self->zoom);
+    break;
+  case PROP_CRS:
+    g_value_set_string(value, self->crs);
     break;
   case PROP_BEARING:
     g_value_set_double(value, self->bearing);
@@ -455,6 +548,10 @@ static void osmium_map_class_init(OsmiumMapClass *klass) {
       "bearing", NULL, "Rotation of the map in degrees clockwise from north-up", 0.0, 360.0, 0.0,
       G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
 
+  properties[PROP_CRS] = g_param_spec_string(
+      "crs", NULL, "Coordinate system the map is drawn in (EPSG:3857 by default)", "EPSG:3857",
+      G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
+
   g_object_class_install_properties(object_class, N_PROPS, properties);
 
   signals[SIGNAL_VIEW_CHANGED] = g_signal_new("view-changed",
@@ -473,6 +570,8 @@ static void osmium_map_init(OsmiumMap *self) {
   self->lat = 0.0;
   self->lon = 0.0;
   self->zoom = 4;
+  self->crs = g_strdup("EPSG:3857");
+  self->projection = osmium_projection_new(self->crs, NULL, 0);
 
   self->coordinates_text = gtk_widget_create_pango_layout(GTK_WIDGET(self), NULL);
 

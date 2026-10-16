@@ -63,8 +63,8 @@ static int acc_add_point(Accumulator *acc, double x, double y) {
     acc->cap_points = cap;
   }
 
-  acc->xy[acc->n_points * 2] = (x + WEB_MERCATOR_HALF_WORLD) / (2.0 * WEB_MERCATOR_HALF_WORLD);
-  acc->xy[acc->n_points * 2 + 1] = (WEB_MERCATOR_HALF_WORLD - y) / (2.0 * WEB_MERCATOR_HALF_WORLD);
+  acc->xy[acc->n_points * 2] = x;
+  acc->xy[acc->n_points * 2 + 1] = y;
   acc->n_points++;
   return 1;
 }
@@ -123,6 +123,7 @@ static int collect(OGRGeometryH geom, Accumulator *acc) {
 
 static void feature_clear(OsmiumVectorFeature *f) {
   free(f->part_start);
+  free(f->ll);
   free(f->xy);
   memset(f, 0, sizeof(*f));
 }
@@ -142,41 +143,9 @@ static int feature_from(OGRGeometryH geom, OsmiumVectorFeature *out) {
   out->kind = kind;
   out->n_parts = acc.n_parts;
   out->part_start = acc.part_start;
-  out->xy = acc.xy;
-  out->min_x = out->max_x = acc.xy[0];
-  out->min_y = out->max_y = acc.xy[1];
-  for (size_t i = 1; i < acc.n_points; i++) {
-    const double x = acc.xy[i * 2];
-    const double y = acc.xy[i * 2 + 1];
-    out->min_x = fmin(out->min_x, x);
-    out->max_x = fmax(out->max_x, x);
-    out->min_y = fmin(out->min_y, y);
-    out->max_y = fmax(out->max_y, y);
-  }
+  out->ll = acc.xy;
+  out->xy = NULL;
   return 1;
-}
-
-static OGRCoordinateTransformationH make_transform(OGRLayerH layer) {
-  OGRSpatialReferenceH source = NULL;
-  OGRSpatialReferenceH target = OSRNewSpatialReference(NULL);
-  OGRSpatialReferenceH layer_srs = OGR_L_GetSpatialRef(layer);
-
-  if (layer_srs != NULL) {
-    source = OSRClone(layer_srs);
-  } else {
-    source = OSRNewSpatialReference(NULL);
-    OSRImportFromEPSG(source, 4326);
-  }
-  OSRImportFromEPSG(target, 3857);
-
-  OSRSetAxisMappingStrategy(source, OAMS_TRADITIONAL_GIS_ORDER);
-  OSRSetAxisMappingStrategy(target, OAMS_TRADITIONAL_GIS_ORDER);
-
-  OGRCoordinateTransformationH ct = OCTNewCoordinateTransformation(source, target);
-
-  OSRDestroySpatialReference(source);
-  OSRDestroySpatialReference(target);
-  return ct;
 }
 
 typedef struct {
@@ -236,24 +205,152 @@ static osmium_error download(const char *url, const char *user_agent, Download *
   return result == CURLE_OK && dl->len > 0 ? OSMIUM_OK : OSMIUM_NETWORK_ERROR;
 }
 
-static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
+static char *describe_srs(OGRSpatialReferenceH srs) {
+  const char *authority = OSRGetAuthorityName(srs, NULL);
+  const char *code = OSRGetAuthorityCode(srs, NULL);
+  char *wkt = NULL;
+
+  if (authority && code) {
+    size_t len = strlen(authority) + strlen(code) + 2;
+    char *out = malloc(len);
+
+    if (out) {
+      snprintf(out, len, "%s:%s", authority, code);
+    }
+    return out;
+  }
+
+  if (OSRExportToWkt(srs, &wkt) != OGRERR_NONE || !wkt) {
+    return NULL;
+  }
+
+  char *out = strdup(wkt);
+
+  CPLFree(wkt);
+  return out;
+}
+
+static size_t point_count(const OsmiumVectorFeature *f) {
+  return f->n_parts ? f->part_start[f->n_parts] : 0;
+}
+
+static void lonlat_extent(OsmiumVectorData *vec, const OsmiumVectorFeature *f) {
+  const size_t n = point_count(f);
+
+  for (size_t i = 0; i < n; i++) {
+    const double lon = f->ll[i * 2];
+    const double lat = f->ll[i * 2 + 1];
+
+    if (!isfinite(lon) || !isfinite(lat)) {
+      continue;
+    }
+    vec->lon_min = fmin(vec->lon_min, lon);
+    vec->lon_max = fmax(vec->lon_max, lon);
+    vec->lat_min = fmin(vec->lat_min, lat);
+    vec->lat_max = fmax(vec->lat_max, lat);
+  }
+}
+
+static int source_area(OGRLayerH layer, const char *source, double area[4]) {
+  OGREnvelope envelope;
+  OsmiumTransform *rough;
+
+  if (OGR_L_GetExtent(layer, &envelope, TRUE) != OGRERR_NONE) {
+    return 0;
+  }
+
+  rough = osmium_transform_new(source, "EPSG:4326", NULL, NULL, 0);
+  if (!rough) {
+    return 0;
+  }
+
+  double corners[10] = {envelope.MinX, envelope.MinY, envelope.MaxX, envelope.MinY, envelope.MaxX,
+                        envelope.MaxY, envelope.MinX, envelope.MaxY,
+                        (envelope.MinX + envelope.MaxX) / 2.0, (envelope.MinY + envelope.MaxY) / 2.0};
+
+  osmium_transform_apply(rough, corners, 5);
+  osmium_transform_free(rough);
+
+  /* a bogus or assumed coordinate system can put the extent outside the globe */
+  for (int i = 0; i < 5; i++) {
+    if (!isfinite(corners[i * 2]) || !isfinite(corners[i * 2 + 1]) || fabs(corners[i * 2]) > 180.0 ||
+        fabs(corners[i * 2 + 1]) > 90.0) {
+      corners[i * 2] = corners[i * 2 + 1] = NAN;
+    }
+  }
+
+  int found = 0;
+
+  for (int i = 0; i < 5; i++) {
+    if (!isfinite(corners[i * 2]) || !isfinite(corners[i * 2 + 1])) {
+      continue;
+    }
+    if (!found) {
+      area[0] = area[2] = corners[i * 2];
+      area[1] = area[3] = corners[i * 2 + 1];
+      found = 1;
+    } else {
+      area[0] = fmin(area[0], corners[i * 2]);
+      area[1] = fmin(area[1], corners[i * 2 + 1]);
+      area[2] = fmax(area[2], corners[i * 2]);
+      area[3] = fmax(area[3], corners[i * 2 + 1]);
+    }
+  }
+  return found;
+}
+
+static osmium_error read_dataset(GDALDatasetH dataset,
+                                 const char *source_crs,
+                                 const OsmiumProjection *projection,
+                                 OsmiumVectorData **out) {
   OGRLayerH layer = GDALDatasetGetLayer(dataset, 0);
   if (!layer) {
     return OSMIUM_FILE_ERROR;
   }
 
-  OGRCoordinateTransformationH ct = make_transform(layer);
-  if (!ct) {
-    return OSMIUM_CRS_ERROR;
-  }
-
   OsmiumVectorData *vec = calloc(1, sizeof(*vec));
   if (!vec) {
-    OCTDestroyCoordinateTransformation(ct);
     return OSMIUM_OUT_OF_MEMORY;
   }
   atomic_init(&vec->refs, 1);
   pthread_mutex_init(&vec->lock, NULL);
+  pthread_rwlock_init(&vec->xy_lock, NULL);
+  vec->lon_min = vec->lat_min = INFINITY;
+  vec->lon_max = vec->lat_max = -INFINITY;
+  vec->crs_accuracy = -1.0;
+
+  if (source_crs && *source_crs) {
+    vec->crs_definition = strdup(source_crs);
+  } else {
+    OGRSpatialReferenceH layer_srs = OGR_L_GetSpatialRef(layer);
+
+    if (layer_srs) {
+      vec->crs_definition = describe_srs(layer_srs);
+    } else {
+      vec->crs_definition = strdup("EPSG:4326");
+      vec->crs_assumed = 1;
+    }
+  }
+
+  OsmiumCrsInfo info;
+
+  if (!vec->crs_definition || !osmium_crs_describe_internal(vec->crs_definition, &info)) {
+    osmium_vector_data_free(vec);
+    return OSMIUM_CRS_ERROR;
+  }
+  vec->crs_name = info.name;
+  vec->crs_code = info.code;
+
+  double area[4];
+  const int has_area = source_area(layer, vec->crs_definition, area);
+  OsmiumTransform *to_geographic = osmium_transform_new(vec->crs_definition, "EPSG:4326", has_area ? area : NULL, NULL, 0);
+
+  if (!to_geographic) {
+    osmium_vector_data_free(vec);
+    return OSMIUM_CRS_ERROR;
+  }
+  vec->crs_ballpark = osmium_transform_is_ballpark(to_geographic);
+  vec->crs_accuracy = osmium_transform_accuracy(to_geographic);
 
   size_t cap = 0;
   osmium_error err = OSMIUM_OK;
@@ -265,7 +362,15 @@ static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
     OsmiumVectorFeature item = {0};
     item.fid = OGR_F_GetFID(feature);
 
-    if (geom != NULL && OGR_G_Transform(geom, ct) == OGRERR_NONE && feature_from(geom, &item)) {
+    if (geom != NULL && feature_from(geom, &item)) {
+      const size_t n = point_count(&item);
+
+      if (osmium_transform_apply(to_geographic, item.ll, n) == n) {
+        feature_clear(&item);
+        OGR_F_Destroy(feature);
+        continue;
+      }
+
       if (vec->n_features == cap) {
         cap = cap ? cap * 2 : 256;
         OsmiumVectorFeature *grown = realloc(vec->features, cap * sizeof(*grown));
@@ -278,25 +383,18 @@ static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
         vec->features = grown;
       }
 
-      if (vec->n_features == 0) {
-        vec->min_x = item.min_x;
-        vec->min_y = item.min_y;
-        vec->max_x = item.max_x;
-        vec->max_y = item.max_y;
-      } else {
-        vec->min_x = fmin(vec->min_x, item.min_x);
-        vec->min_y = fmin(vec->min_y, item.min_y);
-        vec->max_x = fmax(vec->max_x, item.max_x);
-        vec->max_y = fmax(vec->max_y, item.max_y);
-      }
+      lonlat_extent(vec, &item);
       vec->features[vec->n_features++] = item;
     }
 
     OGR_F_Destroy(feature);
   }
 
-  OCTDestroyCoordinateTransformation(ct);
+  osmium_transform_free(to_geographic);
 
+  if (err == OSMIUM_OK) {
+    err = osmium_vector_data_project(vec, projection);
+  }
   if (err != OSMIUM_OK) {
     osmium_vector_data_free(vec);
     return err;
@@ -306,13 +404,105 @@ static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
   return OSMIUM_OK;
 }
 
+osmium_error osmium_vector_data_project(OsmiumVectorData *vec, const OsmiumProjection *projection) {
+  if (!vec || !projection) {
+    return OSMIUM_NULL_POINTER;
+  }
+
+  pthread_rwlock_wrlock(&vec->xy_lock);
+
+  if (vec->projected_definition &&
+      strcmp(vec->projected_definition, osmium_projection_get_definition(projection)) == 0) {
+    pthread_rwlock_unlock(&vec->xy_lock);
+    return OSMIUM_OK;
+  }
+
+  vec->min_x = vec->min_y = INFINITY;
+  vec->max_x = vec->max_y = -INFINITY;
+
+  for (size_t i = 0; i < vec->n_features; i++) {
+    OsmiumVectorFeature *f = &vec->features[i];
+    const size_t n = point_count(f);
+
+    if (!f->xy) {
+      f->xy = malloc(n * 2 * sizeof(double));
+    }
+    if (!f->xy) {
+      pthread_rwlock_unlock(&vec->xy_lock);
+      return OSMIUM_OUT_OF_MEMORY;
+    }
+
+    memcpy(f->xy, f->ll, n * 2 * sizeof(double));
+
+    f->min_x = f->min_y = INFINITY;
+    f->max_x = f->max_y = -INFINITY;
+
+    if (osmium_projection_forward_many(projection, f->xy, n) > 0) {
+      /* a vertex outside the projection's domain: keep the feature out of drawing */
+      continue;
+    }
+
+    for (size_t p = 0; p < n; p++) {
+      f->min_x = fmin(f->min_x, f->xy[p * 2]);
+      f->max_x = fmax(f->max_x, f->xy[p * 2]);
+      f->min_y = fmin(f->min_y, f->xy[p * 2 + 1]);
+      f->max_y = fmax(f->max_y, f->xy[p * 2 + 1]);
+    }
+
+    vec->min_x = fmin(vec->min_x, f->min_x);
+    vec->max_x = fmax(vec->max_x, f->max_x);
+    vec->min_y = fmin(vec->min_y, f->min_y);
+    vec->max_y = fmax(vec->max_y, f->max_y);
+  }
+
+  free(vec->projected_definition);
+  vec->projected_definition = strdup(osmium_projection_get_definition(projection));
+  pthread_rwlock_unlock(&vec->xy_lock);
+  return OSMIUM_OK;
+}
+
+int osmium_vector_data_begin_read(OsmiumVectorData *vec, const OsmiumProjection *projection) {
+  for (;;) {
+    pthread_rwlock_rdlock(&vec->xy_lock);
+
+    if (vec->projected_definition &&
+        strcmp(vec->projected_definition, osmium_projection_get_definition(projection)) == 0) {
+      return 1;
+    }
+
+    pthread_rwlock_unlock(&vec->xy_lock);
+    if (osmium_vector_data_project(vec, projection) != OSMIUM_OK) {
+      return 0;
+    }
+  }
+}
+
+int osmium_vector_data_try_begin_read(OsmiumVectorData *vec, const OsmiumProjection *projection) {
+  if (pthread_rwlock_tryrdlock(&vec->xy_lock) != 0) {
+    return 0;
+  }
+
+  if (vec->projected_definition &&
+      strcmp(vec->projected_definition, osmium_projection_get_definition(projection)) == 0) {
+    return 1;
+  }
+
+  pthread_rwlock_unlock(&vec->xy_lock);
+  return 0;
+}
+
+void osmium_vector_data_end_read(OsmiumVectorData *vec) {
+  pthread_rwlock_unlock(&vec->xy_lock);
+}
 
 osmium_error osmium_vector_data_open(const char *path,
                                      const char *user_agent,
+                                     const char *source_crs,
+                                     const OsmiumProjection *projection,
                                      OsmiumVectorData **out) {
   static atomic_uint counter;
 
-  if (!path || !out) {
+  if (!path || !out || !projection) {
     return OSMIUM_NULL_POINTER;
   }
   *out = NULL;
@@ -325,7 +515,7 @@ osmium_error osmium_vector_data_open(const char *path,
       return OSMIUM_FILE_ERROR;
     }
 
-    osmium_error err = read_dataset(dataset, out);
+    osmium_error err = read_dataset(dataset, source_crs, projection, out);
     GDALClose(dataset);
     if (err == OSMIUM_OK) {
       (*out)->source_path = strdup(path);
@@ -354,7 +544,7 @@ osmium_error osmium_vector_data_open(const char *path,
   if (!dataset) {
     err = OSMIUM_FILE_ERROR;
   } else {
-    err = read_dataset(dataset, out);
+    err = read_dataset(dataset, source_crs, projection, out);
     GDALClose(dataset);
   }
 
@@ -386,6 +576,11 @@ void osmium_vector_data_free(OsmiumVectorData *vec) {
   if (vec->dataset) {
     GDALClose(vec->dataset);
   }
+  free(vec->projected_definition);
+  free(vec->crs_definition);
+  free(vec->crs_name);
+  free(vec->crs_code);
+  pthread_rwlock_destroy(&vec->xy_lock);
   if (vec->vsi_name) {
     VSIUnlink(vec->vsi_name);
   }

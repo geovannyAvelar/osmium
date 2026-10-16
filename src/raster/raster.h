@@ -7,19 +7,32 @@
 
 typedef struct OsmiumRaster OsmiumRaster;
 
-osmium_error osmium_raster_open(const char *path, const char *user_agent, OsmiumRaster **out);
+osmium_error osmium_raster_open(const char *path,
+                                const char *user_agent,
+                                const char *source_crs,
+                                OsmiumRaster **out);
 
 OsmiumRaster *osmium_raster_ref(OsmiumRaster *raster);
 
 void osmium_raster_unref(OsmiumRaster *raster);
 
+/* Extent in WGS 84 degrees. */
 void osmium_raster_get_extent(const OsmiumRaster *raster,
-                              double *min_x,
-                              double *min_y,
-                              double *max_x,
-                              double *max_y);
+                              double *lon_min,
+                              double *lat_min,
+                              double *lon_max,
+                              double *lat_max);
 
+void osmium_raster_get_crs_info(const OsmiumRaster *raster,
+                                const char **name,
+                                const char **code,
+                                int *assumed,
+                                int *ballpark,
+                                double *accuracy);
+
+/* Renders the area (in units of target_crs) at width x height pixels as RGBA. */
 osmium_error osmium_raster_render(const OsmiumRaster *raster,
+                                  const char *target_crs,
                                   double min_x,
                                   double min_y,
                                   double max_x,
@@ -27,3 +40,15 @@ osmium_error osmium_raster_render(const OsmiumRaster *raster,
                                   int width,
                                   int height,
                                   unsigned char **rgba);
+
+/* Reprojects an encoded image (PNG, JPEG, ...) whose bounding box is known, as returned by a map
+ * server, into target_crs. Boxes are minx, miny, maxx, maxy in CRS units. Returns RGBA. */
+osmium_error osmium_image_reproject(const unsigned char *data,
+                                    size_t len,
+                                    const char *source_crs,
+                                    const double *source_box,
+                                    const char *target_crs,
+                                    const double *target_box,
+                                    int width,
+                                    int height,
+                                    unsigned char **rgba);

@@ -36,6 +36,7 @@ struct _OsmiumTileLayer {
 
   OsmiumMap *map; /* weak */
   gulong view_handler;
+  gulong crs_handler;
 
   char *template_url;
   char *user_agent;
@@ -55,7 +56,7 @@ OSMIUM_API GType osmium_tile_layer_get_type(void);
 
 G_DEFINE_TYPE(OsmiumTileLayer, osmium_tile_layer, GTK_TYPE_WIDGET)
 
-enum { PROP_0, PROP_MAP, PROP_TEMPLATE_URL, PROP_USER_AGENT, PROP_CACHE_FOLDER, N_PROPS };
+enum { PROP_0, PROP_MAP, PROP_TEMPLATE_URL, PROP_USER_AGENT, PROP_CACHE_FOLDER, PROP_COMPATIBLE, N_PROPS };
 
 static GParamSpec *properties[N_PROPS];
 
@@ -288,6 +289,10 @@ static void osmium_tile_layer_prefetch(OsmiumTileLayer *self) {
 }
 
 static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
+  if (self->map != NULL && !osmium_map_crs_is_web_mercator(self->map)) {
+    return;
+  }
+
   const guint zoom = self->map != NULL ? osmium_map_get_zoom(self->map) : 0;
   osmium_tile *tiles = NULL;
 
@@ -322,6 +327,15 @@ static void osmium_tile_layer_load_tiles(OsmiumTileLayer *self) {
   }
 
   free(tiles);
+}
+
+static void osmium_tile_layer_reload(OsmiumTileLayer *self);
+
+static void on_map_crs_changed(GObject *map, GParamSpec *pspec, gpointer user_data) {
+  OsmiumTileLayer *self = OSMIUM_TILE_LAYER(user_data);
+
+  osmium_tile_layer_reload(self);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_COMPATIBLE]);
 }
 
 static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
@@ -364,7 +378,7 @@ static gint compare_job_priority(gconstpointer a, gconstpointer b, gpointer user
 static void osmium_tile_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
   OsmiumTileLayer *self = OSMIUM_TILE_LAYER(widget);
 
-  if (self->map == NULL) {
+  if (self->map == NULL || !osmium_map_crs_is_web_mercator(self->map)) {
     return;
   }
 
@@ -436,17 +450,21 @@ void osmium_tile_layer_set_map(OsmiumTileLayer *self, OsmiumMap *map) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
   if (map != NULL) {
     g_set_weak_pointer(&self->map, map);
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
+    self->crs_handler = g_signal_connect(map, "notify::crs", G_CALLBACK(on_map_crs_changed), self);
   }
 
   osmium_tile_layer_reload(self);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_MAP]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_COMPATIBLE]);
 }
 
 const char *osmium_tile_layer_get_template_url(OsmiumTileLayer *self) {
@@ -525,7 +543,9 @@ static void osmium_tile_layer_dispose(GObject *object) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
@@ -582,6 +602,9 @@ static void osmium_tile_layer_get_property(GObject *object,
   case PROP_CACHE_FOLDER:
     g_value_set_string(value, self->cache_folder);
     break;
+  case PROP_COMPATIBLE:
+    g_value_set_boolean(value, self->map == NULL || osmium_map_crs_is_web_mercator(self->map));
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
@@ -611,6 +634,10 @@ static void osmium_tile_layer_class_init(OsmiumTileLayerClass *klass) {
   properties[PROP_CACHE_FOLDER] = g_param_spec_string(
       "cache-folder", NULL, "Folder where downloaded tiles are cached", NULL,
       G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
+
+  properties[PROP_COMPATIBLE] = g_param_spec_boolean(
+      "compatible", NULL, "Whether the map coordinate system can show tiles (Web Mercator only)", TRUE,
+      G_PARAM_READABLE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
 
   g_object_class_install_properties(object_class, N_PROPS, properties);
 

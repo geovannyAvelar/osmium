@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_raster_layer.h"
 
+#include "osmium_map_private.h"
 #include "raster/raster.h"
 #include "tms/tms.h"
 #include <math.h>
@@ -8,17 +9,17 @@
 
 #define OSMIUM_RASTER_LAYER_RELOAD_DELAY_MS 150
 #define OSMIUM_RASTER_LAYER_MAX_SIZE 4096
-#define WEB_MERCATOR_HALF_WORLD 20037508.342789244
-#define WEB_MERCATOR_RADIUS 6378137.0
 
 typedef struct {
   char *path;
   char *user_agent;
+  char *source_crs;
   guint generation;
 } OpenJob;
 
 typedef struct {
   OsmiumRaster *raster;
+  OsmiumProjection *projection;
   guint id;
   guint zoom;
   double x;
@@ -42,9 +43,11 @@ struct _OsmiumRasterLayer {
 
   OsmiumMap *map; /* weak */
   gulong view_handler;
+  gulong crs_handler;
 
   char *path;
   char *user_agent;
+  char *source_crs;
   gboolean loading;
 
   guint generation;
@@ -59,7 +62,7 @@ OSMIUM_API GType osmium_raster_layer_get_type(void);
 
 G_DEFINE_TYPE(OsmiumRasterLayer, osmium_raster_layer, GTK_TYPE_WIDGET)
 
-enum { PROP_0, PROP_MAP, PROP_PATH, PROP_USER_AGENT, PROP_LOADING, PROP_HAS_EXTENT, N_PROPS };
+enum { PROP_0, PROP_MAP, PROP_PATH, PROP_USER_AGENT, PROP_SOURCE_CRS, PROP_LOADING, PROP_HAS_EXTENT, N_PROPS };
 
 enum { SIGNAL_LOAD_FAILED, N_SIGNALS };
 
@@ -83,6 +86,7 @@ static void open_job_free(gpointer data) {
 
   g_free(job->path);
   g_free(job->user_agent);
+  g_free(job->source_crs);
   g_free(job);
 }
 
@@ -90,6 +94,7 @@ static void render_job_free(gpointer data) {
   RenderJob *job = data;
 
   osmium_raster_unref(job->raster);
+  g_clear_pointer(&job->projection, osmium_projection_unref);
   g_free(job);
 }
 
@@ -102,23 +107,11 @@ static void set_loading(OsmiumRasterLayer *self, gboolean loading) {
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LOADING]);
 }
 
-static double world_pixel_to_mercator_x(double px, guint zoom) {
-  const double world = 256.0 * ldexp(1.0, (int)zoom);
-
-  return px / world * 2.0 * WEB_MERCATOR_HALF_WORLD - WEB_MERCATOR_HALF_WORLD;
-}
-
-static double world_pixel_to_mercator_y(double py, guint zoom) {
-  const double world = 256.0 * ldexp(1.0, (int)zoom);
-
-  return WEB_MERCATOR_HALF_WORLD - py / world * 2.0 * WEB_MERCATOR_HALF_WORLD;
-}
-
 static void open_worker(GTask *task, gpointer source, gpointer task_data, GCancellable *cancellable) {
   OpenJob *job = task_data;
   OsmiumRaster *raster = NULL;
 
-  osmium_error err = osmium_raster_open(job->path, job->user_agent, &raster);
+  osmium_error err = osmium_raster_open(job->path, job->user_agent, job->source_crs, &raster);
   if (err == OSMIUM_CRS_ERROR) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
                             "the raster has no usable georeferencing");
@@ -177,6 +170,7 @@ static void start_open(OsmiumRasterLayer *self, gboolean keep_image) {
   OpenJob *job = g_new0(OpenJob, 1);
   job->path = g_strdup(self->path);
   job->user_agent = g_strdup(self->user_agent);
+  job->source_crs = g_strdup(self->source_crs);
   job->generation = self->generation;
 
   GTask *task = g_task_new(self, self->cancellable, on_opened, NULL);
@@ -194,11 +188,16 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
     return;
   }
 
-  osmium_error err = osmium_raster_render(
-      job->raster, world_pixel_to_mercator_x(job->x, job->zoom),
-      world_pixel_to_mercator_y(job->y + job->height, job->zoom),
-      world_pixel_to_mercator_x(job->x + job->width, job->zoom),
-      world_pixel_to_mercator_y(job->y, job->zoom), job->width, job->height, &rgba);
+  const double world = 256.0 * ldexp(1.0, (int)job->zoom);
+  double left, top, right, bottom;
+
+  osmium_projection_normalized_to_units(job->projection, job->x / world, job->y / world, &left, &top);
+  osmium_projection_normalized_to_units(job->projection, (job->x + job->width) / world,
+                                        (job->y + job->height) / world, &right, &bottom);
+
+  osmium_error err = osmium_raster_render(job->raster, osmium_projection_get_definition(job->projection),
+                                          MIN(left, right), MIN(top, bottom), MAX(left, right),
+                                          MAX(top, bottom), job->width, job->height, &rgba);
   if (err != OSMIUM_OK) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "could not render the raster");
     return;
@@ -225,6 +224,7 @@ static void on_rendered(GObject *source, GAsyncResult *result, gpointer user_dat
   }
 
   if (self->map == NULL || job->raster != self->raster ||
+      job->projection != osmium_map_get_projection(self->map) ||
       (self->image != NULL && self->image->id > job->id)) {
     g_object_unref(texture);
     return;
@@ -243,6 +243,42 @@ static void on_rendered(GObject *source, GAsyncResult *result, gpointer user_dat
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
+static gboolean extent_intersects_view(OsmiumRasterLayer *self, const RenderJob *job) {
+  double lon_min, lat_min, lon_max, lat_max;
+  const double world = 256.0 * ldexp(1.0, (int)job->zoom);
+  const double view_left = job->x / world;
+  const double view_right = (job->x + job->width) / world;
+  const double view_top = job->y / world;
+  const double view_bottom = (job->y + job->height) / world;
+  double left = INFINITY, right = -INFINITY, top = INFINITY, bottom = -INFINITY;
+
+  osmium_raster_get_extent(self->raster, &lon_min, &lat_min, &lon_max, &lat_max);
+
+  for (int i = 0; i <= 10; i++) {
+    for (int j = 0; j <= 10; j++) {
+      if (i != 0 && i != 10 && j != 0 && j != 10) {
+        continue;
+      }
+
+      double nx, ny;
+      const double lon = lon_min + (lon_max - lon_min) * i / 10.0;
+      const double lat = lat_min + (lat_max - lat_min) * j / 10.0;
+
+      if (osmium_projection_forward(job->projection, lon, lat, &nx, &ny)) {
+        left = MIN(left, nx);
+        right = MAX(right, nx);
+        top = MIN(top, ny);
+        bottom = MAX(bottom, ny);
+      }
+    }
+  }
+
+  if (!isfinite(left)) {
+    return TRUE;
+  }
+  return !(right < view_left || left > view_right || bottom < view_top || top > view_bottom);
+}
+
 static void render_now(OsmiumRasterLayer *self) {
   GtkWidget *widget = GTK_WIDGET(self);
   const int width = gtk_widget_get_width(widget);
@@ -258,11 +294,12 @@ static void render_now(OsmiumRasterLayer *self) {
   const double view_height = width * fabs(sin(rad)) + height * fabs(cos(rad));
 
   double center_x, center_y;
-  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
-                     &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   RenderJob *job = g_new0(RenderJob, 1);
   job->raster = osmium_raster_ref(self->raster);
+  job->projection = osmium_projection_ref(osmium_map_get_projection(self->map));
   job->id = ++self->last_request_id;
   job->zoom = zoom;
   job->width = CLAMP((int)ceil(view_width), 1, OSMIUM_RASTER_LAYER_MAX_SIZE);
@@ -270,15 +307,7 @@ static void render_now(OsmiumRasterLayer *self) {
   job->x = floor(center_x - job->width / 2.0);
   job->y = floor(center_y - job->height / 2.0);
 
-  double min_x, min_y, max_x, max_y;
-  osmium_raster_get_extent(self->raster, &min_x, &min_y, &max_x, &max_y);
-
-  const double view_min_x = world_pixel_to_mercator_x(job->x, zoom);
-  const double view_max_x = world_pixel_to_mercator_x(job->x + job->width, zoom);
-  const double view_min_y = world_pixel_to_mercator_y(job->y + job->height, zoom);
-  const double view_max_y = world_pixel_to_mercator_y(job->y, zoom);
-
-  if (max_x < view_min_x || min_x > view_max_x || max_y < view_min_y || min_y > view_max_y) {
+  if (!extent_intersects_view(self, job)) {
     g_clear_pointer(&self->image, image_free);
     gtk_widget_queue_draw(widget);
     render_job_free(job);
@@ -306,6 +335,14 @@ static void osmium_raster_layer_schedule_render(OsmiumRasterLayer *self) {
   self->reload_source = g_timeout_add(OSMIUM_RASTER_LAYER_RELOAD_DELAY_MS, on_reload_timeout, self);
 }
 
+static void on_map_crs_changed(GObject *map, GParamSpec *pspec, gpointer user_data) {
+  OsmiumRasterLayer *self = OSMIUM_RASTER_LAYER(user_data);
+
+  g_clear_pointer(&self->image, image_free);
+  osmium_raster_layer_schedule_render(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
 static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
   OsmiumRasterLayer *self = OSMIUM_RASTER_LAYER(user_data);
 
@@ -329,8 +366,8 @@ static void osmium_raster_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapsho
   gtk_snapshot_push_clip(snapshot, &bounds);
 
   double center_x, center_y;
-  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
-                     &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   const double scale = ldexp(1.0, (int)zoom - (int)self->image->zoom);
 
@@ -368,13 +405,16 @@ void osmium_raster_layer_set_map(OsmiumRasterLayer *self, OsmiumMap *map) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
   if (map != NULL) {
     g_set_weak_pointer(&self->map, map);
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
+    self->crs_handler = g_signal_connect(map, "notify::crs", G_CALLBACK(on_map_crs_changed), self);
   }
 
   g_clear_pointer(&self->image, image_free);
@@ -420,6 +460,50 @@ void osmium_raster_layer_set_user_agent(OsmiumRasterLayer *self, const char *use
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_USER_AGENT]);
 }
 
+const char *osmium_raster_layer_get_source_crs(OsmiumRasterLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_RASTER_LAYER(self), NULL);
+
+  return self->source_crs;
+}
+
+void osmium_raster_layer_set_source_crs(OsmiumRasterLayer *self, const char *source_crs) {
+  g_return_if_fail(OSMIUM_IS_RASTER_LAYER(self));
+
+  const char *wanted = source_crs != NULL && *source_crs != '\0' ? source_crs : NULL;
+
+  if (g_strcmp0(self->source_crs, wanted) == 0) {
+    return;
+  }
+
+  g_free(self->source_crs);
+  self->source_crs = g_strdup(wanted);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SOURCE_CRS]);
+
+  if (self->path != NULL) {
+    start_open(self, TRUE);
+  }
+}
+
+gboolean osmium_raster_layer_get_crs_info(OsmiumRasterLayer *self, OsmiumLayerCrsInfo *info) {
+  g_return_val_if_fail(OSMIUM_IS_RASTER_LAYER(self), FALSE);
+
+  const char *name, *code;
+  int assumed, ballpark;
+  double accuracy;
+
+  if (self->raster == NULL) {
+    return FALSE;
+  }
+
+  osmium_raster_get_crs_info(self->raster, &name, &code, &assumed, &ballpark, &accuracy);
+  info->name = g_strdup(name);
+  info->code = g_strdup(code);
+  info->assumed = assumed;
+  info->ballpark = ballpark;
+  info->accuracy = accuracy;
+  return TRUE;
+}
+
 void osmium_raster_layer_reload(OsmiumRasterLayer *self) {
   g_return_if_fail(OSMIUM_IS_RASTER_LAYER(self));
 
@@ -443,13 +527,7 @@ gboolean osmium_raster_layer_get_extent(OsmiumRasterLayer *self,
     return FALSE;
   }
 
-  double min_x, min_y, max_x, max_y;
-  osmium_raster_get_extent(self->raster, &min_x, &min_y, &max_x, &max_y);
-
-  *lon_min = min_x / WEB_MERCATOR_HALF_WORLD * 180.0;
-  *lon_max = max_x / WEB_MERCATOR_HALF_WORLD * 180.0;
-  *lat_min = atan(sinh(min_y / WEB_MERCATOR_RADIUS)) * 180.0 / G_PI;
-  *lat_max = atan(sinh(max_y / WEB_MERCATOR_RADIUS)) * 180.0 / G_PI;
+  osmium_raster_get_extent(self->raster, lon_min, lat_min, lon_max, lat_max);
   return TRUE;
 }
 
@@ -467,7 +545,9 @@ static void osmium_raster_layer_dispose(GObject *object) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
@@ -476,6 +556,7 @@ static void osmium_raster_layer_dispose(GObject *object) {
   g_clear_pointer(&self->raster, osmium_raster_unref);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
+  g_clear_pointer(&self->source_crs, g_free);
 
   G_OBJECT_CLASS(osmium_raster_layer_parent_class)->dispose(object);
 }
@@ -495,6 +576,9 @@ static void osmium_raster_layer_set_property(GObject *object,
     break;
   case PROP_USER_AGENT:
     osmium_raster_layer_set_user_agent(self, g_value_get_string(value));
+    break;
+  case PROP_SOURCE_CRS:
+    osmium_raster_layer_set_source_crs(self, g_value_get_string(value));
     break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -516,6 +600,9 @@ static void osmium_raster_layer_get_property(GObject *object,
     break;
   case PROP_USER_AGENT:
     g_value_set_string(value, self->user_agent);
+    break;
+  case PROP_SOURCE_CRS:
+    g_value_set_string(value, self->source_crs);
     break;
   case PROP_LOADING:
     g_value_set_boolean(value, self->loading);
@@ -545,6 +632,8 @@ static void osmium_raster_layer_class_init(OsmiumRasterLayerClass *klass) {
       flags);
   properties[PROP_USER_AGENT] = g_param_spec_string(
       "user-agent", NULL, "User-Agent sent when the raster is read from a URL", "Osmium/0.1", flags);
+  properties[PROP_SOURCE_CRS] = g_param_spec_string(
+      "source-crs", NULL, "Coordinate system of the raster when it is missing or wrong (empty = use the file's)", NULL, flags);
   properties[PROP_LOADING] =
       g_param_spec_boolean("loading", NULL, "Whether the raster is being opened", FALSE, read_only);
   properties[PROP_HAS_EXTENT] =

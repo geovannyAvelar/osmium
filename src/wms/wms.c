@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "wms.h"
+
+#include "../proj/projection.h"
 #include "osmium.h"
 
 #include <curl/curl.h>
@@ -503,16 +505,6 @@ void osmium_wms_capabilities_free(OsmiumWmsCapabilities *caps) {
   free(caps);
 }
 
-static int crs_is_lat_first(const char *crs) {
-  static const char *const codes[] = {"EPSG:4326", "EPSG:4258", "EPSG:4269"};
-  for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
-    if (strcasecmp(crs, codes[i]) == 0) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
 osmium_error osmium_wms_get_map(const OsmiumWmsGetMapParams *params,
                                 const char *user_agent,
                                 OsmiumWmsImage *out) {
@@ -530,7 +522,7 @@ osmium_error osmium_wms_get_map(const OsmiumWmsGetMapParams *params,
   int v13 = strcmp(version, "1.3.0") == 0;
 
   double bbox[4] = {params->bbox[0], params->bbox[1], params->bbox[2], params->bbox[3]};
-  if (v13 && crs_is_lat_first(params->crs)) {
+  if (v13 && osmium_crs_axis_swapped(params->crs)) {
     bbox[0] = params->bbox[1];
     bbox[1] = params->bbox[0];
     bbox[2] = params->bbox[3];

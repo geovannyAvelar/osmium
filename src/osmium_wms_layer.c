@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_wms_layer.h"
 
+#include "osmium_map_private.h"
+#include "raster/raster.h"
 #include "tms/tms.h"
 #include "wms/wms.h"
+#include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <gio/gio.h>
 
@@ -11,9 +15,10 @@
 #define OSMIUM_WMS_LAYER_DEFAULT_VERSION "1.3.0"
 #define OSMIUM_WMS_LAYER_RELOAD_DELAY_MS 200
 #define OSMIUM_WMS_LAYER_MAX_SIZE 4096
-#define WEB_MERCATOR_HALF_WORLD 20037508.342789244
 
 typedef struct {
+  OsmiumProjection *projection;
+  char *request_crs;
   guint id;
   guint zoom;
   double x;
@@ -44,6 +49,8 @@ struct _OsmiumWmsLayer {
 
   OsmiumMap *map; /* weak */
   gulong view_handler;
+  gulong crs_handler;
+  char **supported_crs;
 
   char *url;
   char *layers;
@@ -73,6 +80,7 @@ enum {
   PROP_VERSION,
   PROP_USER_AGENT,
   PROP_TRANSPARENT,
+  PROP_SUPPORTED_CRS,
   N_PROPS
 };
 
@@ -87,6 +95,8 @@ static void wms_job_free(gpointer data) {
   g_free(job->styles);
   g_free(job->format);
   g_free(job->user_agent);
+  g_free(job->request_crs);
+  g_clear_pointer(&job->projection, osmium_projection_unref);
   g_free(job);
 }
 
@@ -100,30 +110,112 @@ static void wms_image_free(gpointer data) {
   g_free(image);
 }
 
-static double world_pixel_to_mercator_x(double px, guint zoom) {
-  const double world = 256.0 * (double)(1u << zoom);
-  return px / world * 2.0 * WEB_MERCATOR_HALF_WORLD - WEB_MERCATOR_HALF_WORLD;
+static gboolean crs_equal(const char *a, const char *b) {
+  return a != NULL && b != NULL && g_ascii_strcasecmp(a, b) == 0;
 }
 
-static double world_pixel_to_mercator_y(double py, guint zoom) {
-  const double world = 256.0 * (double)(1u << zoom);
-  return WEB_MERCATOR_HALF_WORLD - py / world * 2.0 * WEB_MERCATOR_HALF_WORLD;
+static gboolean list_has(char **list, const char *crs) {
+  for (guint i = 0; list != NULL && list[i] != NULL; i++) {
+    if (crs_equal(list[i], crs)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/* the map's own CRS when the server offers it, else a common one that gets reprojected */
+static char *choose_request_crs(OsmiumWmsLayer *self, OsmiumProjection *projection) {
+  static char *default_list[] = {"EPSG:3857", NULL};
+  char **offered = self->supported_crs != NULL ? self->supported_crs : default_list;
+  const char *code = osmium_projection_get_code(projection);
+
+  if (code != NULL && list_has(offered, code)) {
+    return g_strdup(code);
+  }
+  if (list_has(offered, "EPSG:3857")) {
+    return g_strdup("EPSG:3857");
+  }
+  if (list_has(offered, "EPSG:4326")) {
+    return g_strdup("EPSG:4326");
+  }
+  return g_strdup(offered[0] != NULL ? offered[0] : "EPSG:3857");
+}
+
+static void bounds_in_crs(const char *map_crs,
+                          const char *request_crs,
+                          const double map_box[4],
+                          double out[4]) {
+  OsmiumTransform *transform = osmium_transform_new(map_crs, request_crs, NULL, NULL, 0);
+  double points[2 * 20];
+  size_t n = 0;
+
+  memcpy(out, map_box, 4 * sizeof(double));
+  if (transform == NULL) {
+    return;
+  }
+
+  for (int i = 0; i <= 5; i++) {
+    const double fx = map_box[0] + (map_box[2] - map_box[0]) * i / 5.0;
+    const double fy = map_box[1] + (map_box[3] - map_box[1]) * i / 5.0;
+    const double edges[4][2] = {{fx, map_box[1]}, {fx, map_box[3]}, {map_box[0], fy}, {map_box[2], fy}};
+
+    for (int e = 0; e < 4 && n < 20; e++) {
+      points[n * 2] = edges[e][0];
+      points[n * 2 + 1] = edges[e][1];
+      n++;
+    }
+  }
+
+  osmium_transform_apply(transform, points, n);
+  osmium_transform_free(transform);
+
+  gboolean found = FALSE;
+
+  for (size_t i = 0; i < n; i++) {
+    if (!isfinite(points[i * 2]) || !isfinite(points[i * 2 + 1])) {
+      continue;
+    }
+    if (!found) {
+      out[0] = out[2] = points[i * 2];
+      out[1] = out[3] = points[i * 2 + 1];
+      found = TRUE;
+    } else {
+      out[0] = MIN(out[0], points[i * 2]);
+      out[1] = MIN(out[1], points[i * 2 + 1]);
+      out[2] = MAX(out[2], points[i * 2]);
+      out[3] = MAX(out[3], points[i * 2 + 1]);
+    }
+  }
 }
 
 static void wms_worker(GTask *task, gpointer source, gpointer task_data, GCancellable *cancellable) {
   WmsJob *job = task_data;
   OsmiumWmsImage image;
+  const char *map_crs = osmium_projection_get_definition(job->projection);
+  const double world = 256.0 * ldexp(1.0, (int)job->zoom);
+  double left, top, right, bottom;
+
+  osmium_projection_normalized_to_units(job->projection, job->x / world, job->y / world, &left, &top);
+  osmium_projection_normalized_to_units(job->projection, (job->x + job->width) / world,
+                                        (job->y + job->height) / world, &right, &bottom);
+
+  const double map_box[4] = {MIN(left, right), MIN(top, bottom), MAX(left, right), MAX(top, bottom)};
+  const gboolean same = crs_equal(osmium_projection_get_code(job->projection), job->request_crs);
+  double request_box[4];
+
+  if (same) {
+    memcpy(request_box, map_box, sizeof(request_box));
+  } else {
+    bounds_in_crs(map_crs, job->request_crs, map_box, request_box);
+  }
 
   OsmiumWmsGetMapParams params = {
       .url = job->url,
       .version = job->version,
       .layers = job->layers,
       .styles = job->styles,
-      .crs = "EPSG:3857",
-      .bbox = {world_pixel_to_mercator_x(job->x, job->zoom),
-               world_pixel_to_mercator_y(job->y + job->height, job->zoom),
-               world_pixel_to_mercator_x(job->x + job->width, job->zoom),
-               world_pixel_to_mercator_y(job->y, job->zoom)},
+      .crs = job->request_crs,
+      .bbox = {request_box[0], request_box[1], request_box[2], request_box[3]},
       .width = job->width,
       .height = job->height,
       .format = job->format,
@@ -138,6 +230,26 @@ static void wms_worker(GTask *task, gpointer source, gpointer task_data, GCancel
   osmium_error err = osmium_wms_get_map(&params, job->user_agent, &image);
   if (err != OSMIUM_OK) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "GetMap failed (error %d)", err);
+    return;
+  }
+
+  if (!same) {
+    unsigned char *rgba = NULL;
+
+    err = osmium_image_reproject(image.data, image.len, job->request_crs, request_box, map_crs, map_box,
+                                 job->width, job->height, &rgba);
+    osmium_wms_image_free(&image);
+    if (err != OSMIUM_OK) {
+      g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "could not reproject the map image");
+      return;
+    }
+
+    g_autoptr(GBytes) pixels = g_bytes_new_with_free_func(rgba, (gsize)job->width * job->height * 4, free, rgba);
+
+    g_task_return_pointer(task,
+                          gdk_memory_texture_new(job->width, job->height, GDK_MEMORY_R8G8B8A8, pixels,
+                                                 (gsize)job->width * 4),
+                          g_object_unref);
     return;
   }
 
@@ -171,7 +283,8 @@ static void on_image_ready(GObject *source, GAsyncResult *result, gpointer user_
     return;
   }
 
-  if (self->map == NULL || (self->image != NULL && self->image->id > job->id)) {
+  if (self->map == NULL || job->projection != osmium_map_get_projection(self->map) ||
+      (self->image != NULL && self->image->id > job->id)) {
     g_object_unref(texture);
     return;
   }
@@ -205,10 +318,12 @@ static void osmium_wms_layer_request(OsmiumWmsLayer *self) {
   const double view_height = width * fabs(sin(rad)) + height * fabs(cos(rad));
 
   double center_x, center_y;
-  osmium_world_pixel(
-      osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x, &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   WmsJob *job = g_new0(WmsJob, 1);
+  job->projection = osmium_projection_ref(osmium_map_get_projection(self->map));
+  job->request_crs = choose_request_crs(self, job->projection);
   job->id = ++self->last_request_id;
   job->zoom = zoom;
   job->width = CLAMP((int)ceil(view_width), 1, OSMIUM_WMS_LAYER_MAX_SIZE);
@@ -251,6 +366,14 @@ static void osmium_wms_layer_reset(OsmiumWmsLayer *self) {
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
+static void on_map_crs_changed(GObject *map, GParamSpec *pspec, gpointer user_data) {
+  OsmiumWmsLayer *self = OSMIUM_WMS_LAYER(user_data);
+
+  g_clear_pointer(&self->image, wms_image_free);
+  osmium_wms_layer_schedule_reload(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
 static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
   OsmiumWmsLayer *self = OSMIUM_WMS_LAYER(user_data);
 
@@ -274,8 +397,8 @@ static void osmium_wms_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) 
   gtk_snapshot_push_clip(snapshot, &bounds);
 
   double center_x, center_y;
-  osmium_world_pixel(
-      osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x, &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   const double scale = pow(2.0, (double)zoom - (double)self->image->zoom);
 
@@ -313,13 +436,16 @@ void osmium_wms_layer_set_map(OsmiumWmsLayer *self, OsmiumMap *map) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
   if (map != NULL) {
     g_set_weak_pointer(&self->map, map);
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
+    self->crs_handler = g_signal_connect(map, "notify::crs", G_CALLBACK(on_map_crs_changed), self);
   }
 
   osmium_wms_layer_reset(self);
@@ -350,6 +476,21 @@ DEFINE_STRING_ACCESSORS(styles, PROP_STYLES, TRUE)
 DEFINE_STRING_ACCESSORS(format, PROP_FORMAT, TRUE)
 DEFINE_STRING_ACCESSORS(version, PROP_VERSION, TRUE)
 DEFINE_STRING_ACCESSORS(user_agent, PROP_USER_AGENT, FALSE)
+
+const char *const *osmium_wms_layer_get_supported_crs(OsmiumWmsLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_WMS_LAYER(self), NULL);
+
+  return (const char *const *)self->supported_crs;
+}
+
+void osmium_wms_layer_set_supported_crs(OsmiumWmsLayer *self, const char *const *crs) {
+  g_return_if_fail(OSMIUM_IS_WMS_LAYER(self));
+
+  g_strfreev(self->supported_crs);
+  self->supported_crs = crs != NULL && crs[0] != NULL ? g_strdupv((char **)crs) : NULL;
+  osmium_wms_layer_reset(self);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUPPORTED_CRS]);
+}
 
 gboolean osmium_wms_layer_get_transparent(OsmiumWmsLayer *self) {
   g_return_val_if_fail(OSMIUM_IS_WMS_LAYER(self), FALSE);
@@ -383,7 +524,9 @@ static void osmium_wms_layer_dispose(GObject *object) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
@@ -395,6 +538,7 @@ static void osmium_wms_layer_dispose(GObject *object) {
   g_clear_pointer(&self->format, g_free);
   g_clear_pointer(&self->version, g_free);
   g_clear_pointer(&self->user_agent, g_free);
+  g_clear_pointer(&self->supported_crs, g_strfreev);
 
   G_OBJECT_CLASS(osmium_wms_layer_parent_class)->dispose(object);
 }
@@ -429,6 +573,9 @@ static void osmium_wms_layer_set_property(GObject *object,
     break;
   case PROP_TRANSPARENT:
     osmium_wms_layer_set_transparent(self, g_value_get_boolean(value));
+    break;
+  case PROP_SUPPORTED_CRS:
+    osmium_wms_layer_set_supported_crs(self, g_value_get_boxed(value));
     break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -466,6 +613,9 @@ static void osmium_wms_layer_get_property(GObject *object,
   case PROP_TRANSPARENT:
     g_value_set_boolean(value, self->transparent);
     break;
+  case PROP_SUPPORTED_CRS:
+    g_value_set_boxed(value, self->supported_crs);
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
@@ -497,6 +647,8 @@ static void osmium_wms_layer_class_init(OsmiumWmsLayerClass *klass) {
   properties[PROP_USER_AGENT] = g_param_spec_string(
       "user-agent", NULL, "User-Agent sent to the server", OSMIUM_WMS_LAYER_DEFAULT_USER_AGENT,
       flags);
+  properties[PROP_SUPPORTED_CRS] = g_param_spec_boxed(
+      "supported-crs", NULL, "Coordinate systems the server offers (EPSG:3857 when unset)", G_TYPE_STRV, flags);
   properties[PROP_TRANSPARENT] =
       g_param_spec_boolean("transparent", NULL, "Request a transparent background", TRUE, flags);
 

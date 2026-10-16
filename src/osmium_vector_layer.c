@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_vector_layer.h"
 
+#include "osmium_map_private.h"
 #include "vector/vector_data.h"
 #include "tms/tms.h"
 #include <math.h>
@@ -20,11 +21,14 @@
 typedef struct {
   char *path;
   char *user_agent;
+  char *source_crs;
+  OsmiumProjection *projection;
   guint generation;
 } LoadJob;
 
 typedef struct {
   OsmiumVectorData *data;
+  OsmiumProjection *projection;
   guint id;
   guint zoom;
   double x;
@@ -52,9 +56,11 @@ struct _OsmiumVectorLayer {
 
   OsmiumMap *map; /* weak */
   gulong view_handler;
+  gulong crs_handler;
 
   char *path;
   char *user_agent;
+  char *source_crs;
   GdkRGBA stroke_color;
   GdkRGBA fill_color;
   double line_width;
@@ -80,6 +86,7 @@ enum {
   PROP_MAP,
   PROP_PATH,
   PROP_USER_AGENT,
+  PROP_SOURCE_CRS,
   PROP_STROKE_COLOR,
   PROP_FILL_COLOR,
   PROP_LINE_WIDTH,
@@ -113,6 +120,8 @@ static void load_job_free(gpointer data) {
 
   g_free(job->path);
   g_free(job->user_agent);
+  g_free(job->source_crs);
+  g_clear_pointer(&job->projection, osmium_projection_unref);
   g_free(job);
 }
 
@@ -120,7 +129,7 @@ static void load_worker(GTask *task, gpointer source, gpointer task_data, GCance
   LoadJob *job = task_data;
   OsmiumVectorData *loaded = NULL;
 
-  osmium_error err = osmium_vector_data_open(job->path, job->user_agent, &loaded);
+  osmium_error err = osmium_vector_data_open(job->path, job->user_agent, job->source_crs, job->projection, &loaded);
   if (err == OSMIUM_CRS_ERROR) {
     g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "unsupported coordinate system");
     return;
@@ -191,6 +200,9 @@ static void start_load(OsmiumVectorLayer *self, gboolean keep_data) {
   LoadJob *job = g_new0(LoadJob, 1);
   job->path = g_strdup(self->path);
   job->user_agent = g_strdup(self->user_agent);
+  job->source_crs = g_strdup(self->source_crs);
+  job->projection = self->map != NULL ? osmium_projection_ref(osmium_map_get_projection(self->map))
+                                      : osmium_projection_new("EPSG:3857", NULL, 0);
   job->generation = self->generation;
 
   GTask *task = g_task_new(self, self->cancellable, on_loaded, NULL);
@@ -201,6 +213,14 @@ static void start_load(OsmiumVectorLayer *self, gboolean keep_data) {
 
 static void schedule_render(OsmiumVectorLayer *self);
 
+static void on_map_crs_changed(GObject *map, GParamSpec *pspec, gpointer user_data) {
+  OsmiumVectorLayer *self = OSMIUM_VECTOR_LAYER(user_data);
+
+  g_clear_pointer(&self->image, image_free);
+  schedule_render(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
 static void on_map_view_changed(OsmiumMap *map, gpointer user_data) {
   schedule_render(OSMIUM_VECTOR_LAYER(user_data));
   gtk_widget_queue_draw(GTK_WIDGET(user_data));
@@ -210,6 +230,7 @@ static void render_job_free(gpointer data) {
   RenderJob *job = data;
 
   osmium_vector_data_free(job->data);
+  g_clear_pointer(&job->projection, osmium_projection_unref);
   g_free(job);
 }
 
@@ -367,6 +388,11 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
     return;
   }
 
+  if (!osmium_vector_data_begin_read(job->data, job->projection)) {
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "could not project the features");
+    return;
+  }
+
   const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, job->width);
   const gsize size = (gsize)stride * (gsize)job->height;
   unsigned char *pixels = g_malloc0(size);
@@ -400,6 +426,7 @@ static void render_worker(GTask *task, gpointer source, gpointer task_data, GCan
       g_thread_join(threads[i]);
     }
   }
+  osmium_vector_data_end_read(job->data);
 
   g_autoptr(GBytes) bytes = g_bytes_new_take(pixels, size);
   GdkTexture *texture = gdk_memory_texture_new(
@@ -422,6 +449,7 @@ static void on_rendered(GObject *source, GAsyncResult *result, gpointer user_dat
   }
 
   if (self->map == NULL || job->data != self->data ||
+      job->projection != osmium_map_get_projection(self->map) ||
       (self->image != NULL && self->image->id > job->id)) {
     g_object_unref(texture);
     return;
@@ -461,11 +489,12 @@ static void render_now(OsmiumVectorLayer *self) {
   const double view_height = width * fabs(sin(rad)) + height * fabs(cos(rad));
 
   double center_x, center_y;
-  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
-                     &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   RenderJob *job = g_new0(RenderJob, 1);
   job->data = osmium_vector_data_ref(self->data);
+  job->projection = osmium_projection_ref(osmium_map_get_projection(self->map));
   job->id = ++self->last_request_id;
   job->zoom = zoom;
   job->width = CLAMP((int)ceil(view_width * OSMIUM_VECTOR_LAYER_MARGIN), 1, OSMIUM_VECTOR_LAYER_MAX_SIZE);
@@ -543,7 +572,8 @@ static void draw_selection(OsmiumVectorLayer *self,
   static const GdkRGBA outline = {1.0f, 0.68f, 0.0f, 1.0f};
   static const GdkRGBA fill = {1.0f, 0.68f, 0.0f, 0.35f};
 
-  if (self->data == NULL || self->selected_indices->len == 0) {
+  if (self->data == NULL || self->selected_indices->len == 0 ||
+      !osmium_vector_data_try_begin_read(self->data, osmium_map_get_projection(self->map))) {
     return;
   }
 
@@ -590,6 +620,7 @@ static void draw_selection(OsmiumVectorLayer *self,
   gsk_path_unref(area_path);
   gsk_path_unref(line_path);
   gsk_path_unref(point_path);
+  osmium_vector_data_end_read(self->data);
 }
 
 static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
@@ -608,8 +639,8 @@ static void osmium_vector_layer_snapshot(GtkWidget *widget, GtkSnapshot *snapsho
   gtk_snapshot_push_clip(snapshot, &bounds);
 
   double center_x, center_y;
-  osmium_world_pixel(osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom, &center_x,
-                     &center_y);
+  osmium_map_lonlat_to_world(self->map, osmium_map_get_lat(self->map), osmium_map_get_lon(self->map), zoom,
+                             &center_x, &center_y);
 
   if (self->image != NULL) {
     const double scale = ldexp(1.0, (int)zoom - (int)self->image->zoom);
@@ -674,13 +705,19 @@ GArray *osmium_vector_layer_identify(OsmiumVectorLayer *self,
     return result;
   }
 
-  const double x = (lon + 180.0) / 360.0;
-  const double rad = CLAMP(lat, -85.05112878, 85.05112878) * G_PI / 180.0;
-  const double y = (1.0 - log(tan(rad) + 1.0 / cos(rad)) / G_PI) / 2.0;
+  double x, y;
+  OsmiumProjection *projection = osmium_map_get_projection(self->map);
+
+  if (!osmium_projection_forward(projection, lon, lat, &x, &y) ||
+      !osmium_vector_data_begin_read(self->data, projection)) {
+    return result;
+  }
+
   const double tolerance = tolerance_px / (256.0 * ldexp(1.0, (int)osmium_map_get_zoom(self->map)));
 
   const size_t count = osmium_vector_data_hit_test(self->data, x, y, tolerance, fids,
                                                    OSMIUM_VECTOR_LAYER_MAX_HITS);
+  osmium_vector_data_end_read(self->data);
   for (size_t i = 0; i < count; i++) {
     gint64 fid = fids[i];
 
@@ -875,13 +912,16 @@ void osmium_vector_layer_set_map(OsmiumVectorLayer *self, OsmiumMap *map) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
   if (map != NULL) {
     g_set_weak_pointer(&self->map, map);
     self->view_handler = g_signal_connect(map, "view-changed", G_CALLBACK(on_map_view_changed), self);
+    self->crs_handler = g_signal_connect(map, "notify::crs", G_CALLBACK(on_map_crs_changed), self);
   }
 
   g_clear_pointer(&self->image, image_free);
@@ -925,6 +965,50 @@ void osmium_vector_layer_set_user_agent(OsmiumVectorLayer *self, const char *use
   g_free(self->user_agent);
   self->user_agent = g_strdup(user_agent);
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_USER_AGENT]);
+}
+
+const char *osmium_vector_layer_get_source_crs(OsmiumVectorLayer *self) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), NULL);
+
+  return self->source_crs;
+}
+
+void osmium_vector_layer_set_source_crs(OsmiumVectorLayer *self, const char *source_crs) {
+  g_return_if_fail(OSMIUM_IS_VECTOR_LAYER(self));
+
+  const char *wanted = source_crs != NULL && *source_crs != '\0' ? source_crs : NULL;
+
+  if (g_strcmp0(self->source_crs, wanted) == 0) {
+    return;
+  }
+
+  g_free(self->source_crs);
+  self->source_crs = g_strdup(wanted);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SOURCE_CRS]);
+
+  if (self->path != NULL) {
+    start_load(self, TRUE);
+  }
+}
+
+gboolean osmium_vector_layer_get_crs_info(OsmiumVectorLayer *self, OsmiumLayerCrsInfo *info) {
+  g_return_val_if_fail(OSMIUM_IS_VECTOR_LAYER(self), FALSE);
+
+  if (self->data == NULL) {
+    return FALSE;
+  }
+
+  info->name = g_strdup(self->data->crs_name);
+  info->code = g_strdup(self->data->crs_code);
+  info->assumed = self->data->crs_assumed;
+  info->ballpark = self->data->crs_ballpark;
+  info->accuracy = self->data->crs_accuracy;
+  return TRUE;
+}
+
+void osmium_layer_crs_info_clear(OsmiumLayerCrsInfo *info) {
+  g_clear_pointer(&info->name, g_free);
+  g_clear_pointer(&info->code, g_free);
 }
 
 void osmium_vector_layer_reload(OsmiumVectorLayer *self) {
@@ -1030,14 +1114,10 @@ gboolean osmium_vector_layer_get_extent(OsmiumVectorLayer *self,
     return FALSE;
   }
 
-  /* normalized y grows southwards */
-  const double y_south = self->data->max_y;
-  const double y_north = self->data->min_y;
-
-  *lon_min = self->data->min_x * 360.0 - 180.0;
-  *lon_max = self->data->max_x * 360.0 - 180.0;
-  *lat_min = atan(sinh(G_PI * (1.0 - 2.0 * y_south))) * 180.0 / G_PI;
-  *lat_max = atan(sinh(G_PI * (1.0 - 2.0 * y_north))) * 180.0 / G_PI;
+  *lon_min = self->data->lon_min;
+  *lon_max = self->data->lon_max;
+  *lat_min = self->data->lat_min;
+  *lat_max = self->data->lat_max;
   return TRUE;
 }
 
@@ -1050,7 +1130,9 @@ static void osmium_vector_layer_dispose(GObject *object) {
 
   if (self->map != NULL) {
     g_signal_handler_disconnect(self->map, self->view_handler);
+    g_signal_handler_disconnect(self->map, self->crs_handler);
     self->view_handler = 0;
+    self->crs_handler = 0;
     g_clear_weak_pointer(&self->map);
   }
 
@@ -1066,6 +1148,7 @@ static void osmium_vector_layer_dispose(GObject *object) {
   g_clear_pointer(&self->data, osmium_vector_data_free);
   g_clear_pointer(&self->path, g_free);
   g_clear_pointer(&self->user_agent, g_free);
+  g_clear_pointer(&self->source_crs, g_free);
 
   G_OBJECT_CLASS(osmium_vector_layer_parent_class)->dispose(object);
 }
@@ -1085,6 +1168,9 @@ static void osmium_vector_layer_set_property(GObject *object,
     break;
   case PROP_USER_AGENT:
     osmium_vector_layer_set_user_agent(self, g_value_get_string(value));
+    break;
+  case PROP_SOURCE_CRS:
+    osmium_vector_layer_set_source_crs(self, g_value_get_string(value));
     break;
   case PROP_STROKE_COLOR:
     if (g_value_get_boxed(value) != NULL) {
@@ -1123,6 +1209,9 @@ static void osmium_vector_layer_get_property(GObject *object,
   case PROP_USER_AGENT:
     g_value_set_string(value, self->user_agent);
     break;
+  case PROP_SOURCE_CRS:
+    g_value_set_string(value, self->source_crs);
+    break;
   case PROP_STROKE_COLOR:
     g_value_set_boxed(value, &self->stroke_color);
     break;
@@ -1159,6 +1248,8 @@ static void osmium_vector_layer_class_init(OsmiumVectorLayerClass *klass) {
       g_param_spec_object("map", NULL, "The map this layer draws on", OSMIUM_TYPE_MAP, flags);
   properties[PROP_PATH] =
       g_param_spec_string("path", NULL, "File path or http(s) URL of a vector file (shapefile, GeoJSON, ...)", NULL, flags);
+  properties[PROP_SOURCE_CRS] = g_param_spec_string(
+      "source-crs", NULL, "Coordinate system of the file when it is missing or wrong (empty = use the file's)", NULL, flags);
   properties[PROP_USER_AGENT] = g_param_spec_string(
       "user-agent", NULL, "User-Agent sent when the file is downloaded from a URL", "Osmium/0.1", flags);
   properties[PROP_STROKE_COLOR] =

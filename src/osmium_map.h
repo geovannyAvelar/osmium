@@ -38,6 +38,20 @@ OSMIUM_API void osmium_map_set_bearing(OsmiumMap *self, double bearing);
 
 /* Overlays draw in the order added: add layers before controls.
  * Widgets with a "map" property get bound to it. Emits "view-changed" after each view change. */
+/* Coordinate system the map is drawn in. Any definition PROJ accepts (EPSG:4326, EPSG:31983, WKT...).
+ * Returns FALSE and keeps the old one when the definition is not valid. */
+OSMIUM_API const char *osmium_map_get_crs(OsmiumMap *self);
+OSMIUM_API gboolean osmium_map_set_crs(OsmiumMap *self, const char *crs);
+OSMIUM_API const char *osmium_map_get_crs_name(OsmiumMap *self);
+OSMIUM_API gboolean osmium_map_crs_is_web_mercator(OsmiumMap *self);
+
+/* World pixels of a position at a zoom level, in the map's coordinate system. */
+OSMIUM_API void osmium_map_lonlat_to_world(OsmiumMap *self, double lat, double lon, guint zoom, double *px, double *py);
+OSMIUM_API void osmium_map_world_to_lonlat(OsmiumMap *self, double px, double py, guint zoom, double *lat, double *lon);
+
+/* Normalized map coordinates (0..1 over the nominal world) to CRS units. */
+OSMIUM_API void osmium_map_normalized_to_units(OsmiumMap *self, double nx, double ny, double *x, double *y);
+
 OSMIUM_API void osmium_map_widget_to_latlon(OsmiumMap *self, double x, double y, double *lat, double *lon);
 
 OSMIUM_API void osmium_map_add_overlay(OsmiumMap *self, GtkWidget *child);
