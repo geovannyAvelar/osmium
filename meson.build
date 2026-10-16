@@ -19,6 +19,8 @@ proj_dep = dependency('proj')
 add_project_arguments('-fvisibility=hidden', '-Wno-unused-parameter', language: 'c')
 
 osmium_sources = [
+  'src/gdal_setup.c',
+  'src/osmium_analysis.c',
   'src/osmium_compass.c',
   'src/osmium_crs.c',
   'src/osmium_expression.c',
@@ -46,6 +48,7 @@ osmium_sources = [
 
 osmium_headers = [
   'src/osmium.h',
+  'src/osmium_analysis.h',
   'src/osmium_compass.h',
   'src/osmium_crs.h',
   'src/osmium_expression.h',

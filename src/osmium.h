@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "osmium_analysis.h"
 #include "osmium_compass.h"
 #include "osmium_crs.h"
 #include "osmium_expression.h"

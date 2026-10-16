@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_georef.h"
+#include "gdal_setup.h"
 
 #include "proj/projection.h"
 
@@ -27,7 +28,7 @@ guint osmium_georef_minimum_points(OsmiumGeorefMethod method) {
 }
 
 gboolean osmium_georef_image_size(const char *path, guint *width, guint *height, GError **error) {
-  GDALAllRegister();
+  osmium_gdal_init();
 
   GDALDatasetH dataset = GDALOpen(path, GA_ReadOnly);
 
@@ -69,7 +70,7 @@ gboolean osmium_georef_residuals(const OsmiumGcp *points, guint n_points, Osmium
   void *transformer = NULL;
   double sum = 0.0;
 
-  GDALAllRegister();
+  osmium_gdal_init();
   for (guint i = 0; i < n_points; i++) {
     residuals[i] = -1.0;
   }
@@ -140,7 +141,7 @@ gboolean osmium_georef_run(const char *input,
                            const char *target_crs,
                            OsmiumGeorefResampling resampling,
                            GError **error) {
-  GDALAllRegister();
+  osmium_gdal_init();
 
   guint count = 0;
   GDAL_GCP *gcps = build_gcps(points, n_points, &count);

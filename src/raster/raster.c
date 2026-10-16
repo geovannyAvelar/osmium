@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "raster.h"
+#include "../gdal_setup.h"
 
 #include "../osmium_vector_style.h"
 #include "../proj/projection.h"
@@ -36,13 +37,6 @@ struct OsmiumRaster {
   int crs_ballpark;
   double crs_accuracy;
 };
-
-static pthread_once_t gdal_once = PTHREAD_ONCE_INIT;
-
-static void gdal_init(void) {
-  GDALAllRegister();
-  CPLSetConfigOption("GDAL_PAM_ENABLED", "NO");
-}
 
 static int is_remote(const char *path) {
   return strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
@@ -445,7 +439,7 @@ osmium_error osmium_raster_open(const char *path,
   }
   *out = NULL;
 
-  pthread_once(&gdal_once, gdal_init);
+  osmium_gdal_init();
 
   OsmiumRaster *raster = calloc(1, sizeof(*raster));
   if (!raster) {
@@ -862,7 +856,7 @@ osmium_error osmium_image_reproject(const unsigned char *data,
   }
   *rgba = NULL;
 
-  pthread_once(&gdal_once, gdal_init);
+  osmium_gdal_init();
 
   snprintf(name, sizeof(name), "/vsimem/osmium-image-%u", atomic_fetch_add(&counter, 1u));
 

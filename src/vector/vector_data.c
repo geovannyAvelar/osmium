@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "vector_data.h"
+#include "../gdal_setup.h"
 #include "vector_edit.h"
 
 #include <cpl_conv.h>
@@ -29,12 +30,6 @@ typedef struct {
   size_t *part_start;
   unsigned char *roles;
 } Accumulator;
-
-static pthread_once_t gdal_once = PTHREAD_ONCE_INIT;
-
-static void gdal_init(void) {
-  GDALAllRegister();
-}
 
 static int acc_begin_part(Accumulator *acc, unsigned char role) {
   if (acc->n_parts + 2 > acc->cap_parts) {
@@ -559,7 +554,7 @@ osmium_error osmium_vector_data_open(const char *path,
   }
   *out = NULL;
 
-  pthread_once(&gdal_once, gdal_init);
+  osmium_gdal_init();
 
   if (!is_remote(path)) {
     GDALDatasetH dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
@@ -1069,7 +1064,7 @@ osmium_error osmium_vector_data_get_fields(OsmiumVectorData *vec,
 }
 
 static GDALDatasetH open_for_update(const char *path, OGRLayerH *layer, char *message, size_t size) {
-  pthread_once(&gdal_once, gdal_init);
+  osmium_gdal_init();
 
   GDALDatasetH dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_UPDATE, NULL, NULL, NULL);
 

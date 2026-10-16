@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "osmium_vector_layer.h"
+#include "gdal_setup.h"
 
 #include "osmium_vector_layer_private.h"
 #include "vector/vector_data.h"
@@ -60,7 +61,7 @@ static OsmiumFeatureFieldType field_type_from_ogr(OGRFieldDefnH defn) {
 }
 
 OsmiumAttributeTable *osmium_table_open(const char *path, GError **error) {
-  GDALAllRegister();
+  osmium_gdal_init();
 
   GDALDatasetH dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
   OGRLayerH layer = dataset != NULL ? GDALDatasetGetLayer(dataset, 0) : NULL;
