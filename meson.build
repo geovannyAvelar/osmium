@@ -20,11 +20,11 @@ add_project_arguments('-fvisibility=hidden', '-Wno-unused-parameter', language: 
 osmium_sources = [
   'src/osmium_compass.c',
   'src/osmium_map.c',
-  'src/osmium_shapefile_layer.c',
+  'src/osmium_vector_layer.c',
   'src/osmium_tile_layer.c',
   'src/osmium_wms_layer.c',
   'src/osmium_zoom_control.c',
-  'src/shp/shapefile.c',
+  'src/vector/vector_data.c',
   'src/tms/tms.c',
   'src/wms/wms.c',
 ]
@@ -33,7 +33,7 @@ osmium_headers = [
   'src/osmium.h',
   'src/osmium_compass.h',
   'src/osmium_map.h',
-  'src/osmium_shapefile_layer.h',
+  'src/osmium_vector_layer.h',
   'src/osmium_tile_layer.h',
   'src/osmium_wms_layer.h',
   'src/osmium_zoom_control.h',

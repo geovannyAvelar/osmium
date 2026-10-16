@@ -3,7 +3,7 @@
 
 #include "osmium_compass.h"
 #include "osmium_map.h"
-#include "osmium_shapefile_layer.h"
+#include "osmium_vector_layer.h"
 #include "osmium_tile_layer.h"
 #include "osmium_wms_layer.h"
 #include "osmium_zoom_control.h"

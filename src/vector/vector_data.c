@@ -1,16 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-#include "shapefile.h"
+#include "vector_data.h"
 
 #include <cpl_conv.h>
+#include <cpl_vsi.h>
+#include <curl/curl.h>
 #include <gdal.h>
 #include <math.h>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define WEB_MERCATOR_HALF_WORLD 20037508.342789244
+#define OSMIUM_VECTOR_MAX_DOWNLOAD (256u * 1024u * 1024u)
 
 typedef struct {
   size_t n_points;
@@ -62,19 +67,19 @@ static int acc_add_point(Accumulator *acc, double x, double y) {
   return 1;
 }
 
-static int kind_of(OGRGeometryH geom, OsmiumShpKind *kind) {
+static int kind_of(OGRGeometryH geom, OsmiumVectorKind *kind) {
   switch (wkbFlatten(OGR_G_GetGeometryType(geom))) {
   case wkbPoint:
   case wkbMultiPoint:
-    *kind = OSMIUM_SHP_POINT;
+    *kind = OSMIUM_VECTOR_POINT;
     return 1;
   case wkbLineString:
   case wkbMultiLineString:
-    *kind = OSMIUM_SHP_LINE;
+    *kind = OSMIUM_VECTOR_LINE;
     return 1;
   case wkbPolygon:
   case wkbMultiPolygon:
-    *kind = OSMIUM_SHP_POLYGON;
+    *kind = OSMIUM_VECTOR_POLYGON;
     return 1;
   case wkbGeometryCollection:
     return OGR_G_GetGeometryCount(geom) > 0 && kind_of(OGR_G_GetGeometryRef(geom, 0), kind);
@@ -114,15 +119,15 @@ static int collect(OGRGeometryH geom, Accumulator *acc) {
   }
 }
 
-static void feature_clear(OsmiumShpFeature *f) {
+static void feature_clear(OsmiumVectorFeature *f) {
   free(f->part_start);
   free(f->xy);
   memset(f, 0, sizeof(*f));
 }
 
-static int feature_from(OGRGeometryH geom, OsmiumShpFeature *out) {
+static int feature_from(OGRGeometryH geom, OsmiumVectorFeature *out) {
   Accumulator acc = {0};
-  OsmiumShpKind kind;
+  OsmiumVectorKind kind;
 
   if (OGR_G_IsEmpty(geom) || !kind_of(geom, &kind) || !collect(geom, &acc) || acc.n_points == 0) {
     free(acc.xy);
@@ -172,35 +177,77 @@ static OGRCoordinateTransformationH make_transform(OGRLayerH layer) {
   return ct;
 }
 
-osmium_error osmium_shapefile_open(const char *path, OsmiumShapefile **out) {
-  if (!path || !out) {
+typedef struct {
+  char *data;
+  size_t len;
+} Download;
+
+static size_t download_write(char *chunk, size_t size, size_t nmemb, void *userdata) {
+  Download *dl = userdata;
+  size_t n = size * nmemb;
+
+  if (n > OSMIUM_VECTOR_MAX_DOWNLOAD - dl->len) {
+    return 0;
+  }
+
+  char *grown = realloc(dl->data, dl->len + n + 1);
+  if (!grown) {
+    return 0;
+  }
+
+  memcpy(grown + dl->len, chunk, n);
+  dl->len += n;
+  grown[dl->len] = '\0';
+  dl->data = grown;
+  return n;
+}
+
+static int is_remote(const char *path) {
+  return strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
+}
+
+static osmium_error download(const char *url, const char *user_agent, Download *dl) {
+  CURL *curl = curl_easy_init();
+  if (!curl) {
     return OSMIUM_NULL_POINTER;
   }
-  *out = NULL;
 
-  pthread_once(&gdal_once, gdal_init);
+  struct curl_slist *headers =
+      curl_slist_append(NULL, "Accept: application/geo+json, application/json;q=0.9, */*;q=0.5");
 
-  GDALDatasetH dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
-  if (!dataset) {
-    return OSMIUM_FILE_ERROR;
-  }
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, download_write);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, dl);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent ? user_agent : "Osmium/0.1");
+  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
 
+  CURLcode result = curl_easy_perform(curl);
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  return result == CURLE_OK && dl->len > 0 ? OSMIUM_OK : OSMIUM_NETWORK_ERROR;
+}
+
+static osmium_error read_dataset(GDALDatasetH dataset, OsmiumVectorData **out) {
   OGRLayerH layer = GDALDatasetGetLayer(dataset, 0);
   if (!layer) {
-    GDALClose(dataset);
     return OSMIUM_FILE_ERROR;
   }
 
   OGRCoordinateTransformationH ct = make_transform(layer);
   if (!ct) {
-    GDALClose(dataset);
     return OSMIUM_CRS_ERROR;
   }
 
-  OsmiumShapefile *shp = calloc(1, sizeof(*shp));
-  if (!shp) {
+  OsmiumVectorData *vec = calloc(1, sizeof(*vec));
+  if (!vec) {
     OCTDestroyCoordinateTransformation(ct);
-    GDALClose(dataset);
     return OSMIUM_OUT_OF_MEMORY;
   }
 
@@ -211,57 +258,110 @@ osmium_error osmium_shapefile_open(const char *path, OsmiumShapefile **out) {
   OGRFeatureH feature;
   while ((feature = OGR_L_GetNextFeature(layer)) != NULL) {
     OGRGeometryH geom = OGR_F_GetGeometryRef(feature);
-    OsmiumShpFeature item = {0};
+    OsmiumVectorFeature item = {0};
 
     if (geom != NULL && OGR_G_Transform(geom, ct) == OGRERR_NONE && feature_from(geom, &item)) {
-      if (shp->n_features == cap) {
+      if (vec->n_features == cap) {
         cap = cap ? cap * 2 : 256;
-        OsmiumShpFeature *grown = realloc(shp->features, cap * sizeof(*grown));
+        OsmiumVectorFeature *grown = realloc(vec->features, cap * sizeof(*grown));
         if (!grown) {
           feature_clear(&item);
           OGR_F_Destroy(feature);
           err = OSMIUM_OUT_OF_MEMORY;
           break;
         }
-        shp->features = grown;
+        vec->features = grown;
       }
 
-      if (shp->n_features == 0) {
-        shp->min_x = item.min_x;
-        shp->min_y = item.min_y;
-        shp->max_x = item.max_x;
-        shp->max_y = item.max_y;
+      if (vec->n_features == 0) {
+        vec->min_x = item.min_x;
+        vec->min_y = item.min_y;
+        vec->max_x = item.max_x;
+        vec->max_y = item.max_y;
       } else {
-        shp->min_x = fmin(shp->min_x, item.min_x);
-        shp->min_y = fmin(shp->min_y, item.min_y);
-        shp->max_x = fmax(shp->max_x, item.max_x);
-        shp->max_y = fmax(shp->max_y, item.max_y);
+        vec->min_x = fmin(vec->min_x, item.min_x);
+        vec->min_y = fmin(vec->min_y, item.min_y);
+        vec->max_x = fmax(vec->max_x, item.max_x);
+        vec->max_y = fmax(vec->max_y, item.max_y);
       }
-      shp->features[shp->n_features++] = item;
+      vec->features[vec->n_features++] = item;
     }
 
     OGR_F_Destroy(feature);
   }
 
   OCTDestroyCoordinateTransformation(ct);
-  GDALClose(dataset);
 
   if (err != OSMIUM_OK) {
-    osmium_shapefile_free(shp);
+    osmium_vector_data_free(vec);
     return err;
   }
 
-  *out = shp;
+  *out = vec;
   return OSMIUM_OK;
 }
 
-void osmium_shapefile_free(OsmiumShapefile *shp) {
-  if (!shp) {
+
+osmium_error osmium_vector_data_open(const char *path,
+                                     const char *user_agent,
+                                     OsmiumVectorData **out) {
+  static atomic_uint counter;
+
+  if (!path || !out) {
+    return OSMIUM_NULL_POINTER;
+  }
+  *out = NULL;
+
+  pthread_once(&gdal_once, gdal_init);
+
+  if (!is_remote(path)) {
+    GDALDatasetH dataset = GDALOpenEx(path, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
+    if (!dataset) {
+      return OSMIUM_FILE_ERROR;
+    }
+
+    osmium_error err = read_dataset(dataset, out);
+    GDALClose(dataset);
+    return err;
+  }
+
+  Download dl = {0};
+  osmium_error err = download(path, user_agent, &dl);
+  if (err != OSMIUM_OK) {
+    free(dl.data);
+    return err;
+  }
+
+  char name[64];
+  snprintf(name, sizeof(name), "/vsimem/osmium-%u.json", atomic_fetch_add(&counter, 1u));
+
+  VSILFILE *file = VSIFileFromMemBuffer(name, (GByte *)dl.data, dl.len, FALSE);
+  if (!file) {
+    free(dl.data);
+    return OSMIUM_OUT_OF_MEMORY;
+  }
+  VSIFCloseL(file);
+
+  GDALDatasetH dataset = GDALOpenEx(name, GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
+  if (!dataset) {
+    err = OSMIUM_FILE_ERROR;
+  } else {
+    err = read_dataset(dataset, out);
+    GDALClose(dataset);
+  }
+
+  VSIUnlink(name);
+  free(dl.data);
+  return err;
+}
+
+void osmium_vector_data_free(OsmiumVectorData *vec) {
+  if (!vec) {
     return;
   }
-  for (size_t i = 0; i < shp->n_features; i++) {
-    feature_clear(&shp->features[i]);
+  for (size_t i = 0; i < vec->n_features; i++) {
+    feature_clear(&vec->features[i]);
   }
-  free(shp->features);
-  free(shp);
+  free(vec->features);
+  free(vec);
 }
